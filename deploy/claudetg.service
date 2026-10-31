@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram bot for Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/claudetg/claudetg.env
+ExecStart=%h/.local/bin/claudetg
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
