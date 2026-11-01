@@ -112,6 +112,32 @@ impl Bot {
     }
 }
 
+impl Bot {
+    /// Ответ Claude: Markdown → HTML Telegram. Если Telegram отверг разметку
+    /// (неожиданная конструкция), этот кусок уходит обычным текстом — ответ не
+    /// теряется. Предел меньше обычного: HTML-теги удлиняют текст.
+    pub async fn send_markdown(&self, chat_id: i64, text: &str) {
+        let text = if text.trim().is_empty() { "(пустой ответ)" } else { text };
+        for (html, plain) in crate::markdown::to_html_chunks(text, 3000) {
+            let res: Result<Value> = self
+                .call(
+                    "sendMessage",
+                    json!({
+                        "chat_id": chat_id,
+                        "text": html,
+                        "parse_mode": "HTML",
+                        "link_preview_options": { "is_disabled": true },
+                    }),
+                )
+                .await;
+            if let Err(e) = res {
+                log::warn!("sendMessage HTML to {chat_id} rejected, sending plain: {e:#}");
+                self.send_text(chat_id, &plain).await;
+            }
+        }
+    }
+}
+
 /// Splits on line boundaries where possible, never inside a UTF-8 char.
 fn split_message(text: &str, max: usize) -> Vec<String> {
     let mut chunks = Vec::new();

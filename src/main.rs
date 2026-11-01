@@ -1,6 +1,7 @@
 mod claude;
 mod config;
 mod limit;
+mod markdown;
 mod telegram;
 
 use anyhow::Result;
@@ -76,6 +77,19 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let bot = Bot::new(&cfg.bot_token, cfg.proxy_url.as_deref())?;
+
+    // `claudetg send <chat_id> < file.md` — отправить Markdown из stdin в чат и
+    // выйти, без опроса обновлений: проверка разметки и разовые сообщения.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("send") {
+        let chat_id: i64 = args.get(2).and_then(|s| s.parse().ok()).ok_or_else(|| {
+            anyhow::anyhow!("usage: claudetg send <chat_id> < message.md")
+        })?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        bot.send_markdown(chat_id, &text).await;
+        return Ok(());
+    }
     let me = bot.get_me().await?;
     log::info!(
         "started as @{} (proxy: {})",
@@ -332,7 +346,7 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
             if let Some(cost) = outcome.cost_usd {
                 log::info!("chat {chat_id}: turn finished, cost ${cost:.4}");
             }
-            app.bot.send_text(chat_id, &text).await;
+            app.bot.send_markdown(chat_id, &text).await;
             schedule_resume_if_limited(app, chat_id, &text).await;
         }
         Ok(Err(e)) => app.bot.send_text(chat_id, &format!("⚠️ Ошибка запуска claude: {e:#}")).await,

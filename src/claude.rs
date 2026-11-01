@@ -10,8 +10,9 @@ use tokio::sync::{mpsc, Notify};
 use crate::config::Config;
 
 const SYSTEM_PROMPT: &str = "You are talking with the user through a Telegram bot. \
-The user cannot see your tool calls, only your final text answer, which is shown as plain text \
-(markdown is not rendered, so keep formatting simple). \
+The user cannot see your tool calls, only your final text answer. The answer is rendered from \
+Markdown: headings, **bold**, *italic*, `inline code`, fenced code blocks, links, bullet lists and \
+> quotes are shown formatted; tables are flattened into lines, so prefer lists over tables. \
 Interactive tools that wait for user input are not available. If you need a decision or \
 clarification from the user, ask the question in your final answer and stop; the user's \
 reply will arrive as the next message in this same session. \
