@@ -90,6 +90,24 @@ async fn main() -> Result<()> {
         bot.send_markdown(chat_id, &text).await;
         return Ok(());
     }
+    // `claudetg send-file <path> [подпись]` — прислать файл документом в чат
+    // CLAUDETG_CHAT_ID (бот выставляет его процессу claude) или --chat <id>.
+    if args.get(1).map(String::as_str) == Some("send-file") {
+        let mut rest: Vec<String> = args[2..].to_vec();
+        let mut chat = std::env::var("CLAUDETG_CHAT_ID").ok();
+        if let Some(i) = rest.iter().position(|a| a == "--chat") {
+            chat = rest.get(i + 1).cloned();
+            rest.drain(i..(i + 2).min(rest.len()));
+        }
+        let usage = "usage: claudetg send-file [--chat <id>] <path> [caption]";
+        let chat_id: i64 = chat
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("{usage}: chat id not set (CLAUDETG_CHAT_ID)"))?;
+        let path = rest.first().ok_or_else(|| anyhow::anyhow!("{usage}"))?;
+        let caption = rest.get(1).map(String::as_str);
+        bot.send_document(chat_id, std::path::Path::new(path), caption).await?;
+        return Ok(());
+    }
     let me = bot.get_me().await?;
     log::info!(
         "started as @{} (proxy: {})",
@@ -307,7 +325,7 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
     let run = {
         let app = app.clone();
         tokio::spawn(async move {
-            claude::run(&app.cfg, &dir, state.session_id.as_deref(), &prompt, tx, cancel).await
+            claude::run(&app.cfg, &dir, chat_id, state.session_id.as_deref(), &prompt, tx, cancel).await
         })
     };
 

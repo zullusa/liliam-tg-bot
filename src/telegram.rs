@@ -113,6 +113,47 @@ impl Bot {
 }
 
 impl Bot {
+    /// Файл документом (sendDocument, до 50 МБ). Таймаут длиннее обычного:
+    /// большой файл через прокси идёт долго.
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        path: &std::path::Path,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let bytes = tokio::fs::read(path).await?;
+        if bytes.len() > 50 * 1024 * 1024 {
+            bail!("{name}: больше 50 МБ — Telegram не примет");
+        }
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", reqwest::multipart::Part::bytes(bytes).file_name(name));
+        if let Some(c) = caption {
+            form = form.text("caption", c.to_string());
+        }
+        let resp: ApiResponse<Value> = self
+            .client
+            .post(format!("{}/sendDocument", self.base))
+            .multipart(form)
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !resp.ok {
+            bail!(
+                "sendDocument failed: {}",
+                resp.description.unwrap_or_else(|| "unknown error".into())
+            );
+        }
+        Ok(())
+    }
+
     /// Ответ Claude: Markdown → HTML Telegram. Если Telegram отверг разметку
     /// (неожиданная конструкция), этот кусок уходит обычным текстом — ответ не
     /// теряется. Предел меньше обычного: HTML-теги удлиняют текст.

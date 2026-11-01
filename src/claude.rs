@@ -18,7 +18,9 @@ clarification from the user, ask the question in your final answer and stop; the
 reply will arrive as the next message in this same session. \
 Do not put shell commands, command lines, flags or code blocks into your answers: describe in \
 plain words what you did, why, and what came of it. Mention a file name only when it is needed \
-to understand the answer.";
+to understand the answer. \
+To send the user a file (an APK, a report, an image), run `claudetg send-file <path> [caption]`: \
+it delivers the file to this chat as a document (up to 50 MB).";
 
 pub enum Event {
     /// Short progress note, e.g. which tool Claude is running.
@@ -37,6 +39,7 @@ pub struct Outcome {
 pub async fn run(
     cfg: &Config,
     work_dir: &Path,
+    chat_id: i64,
     session_id: Option<&str>,
     prompt: &str,
     events: mpsc::UnboundedSender<Event>,
@@ -55,6 +58,8 @@ pub async fn run(
     }
     cmd.args(&cfg.extra_args)
         .current_dir(work_dir)
+        // Чат, из которого пришёл запрос: `claudetg send-file` шлёт файл туда.
+        .env("CLAUDETG_CHAT_ID", chat_id.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
