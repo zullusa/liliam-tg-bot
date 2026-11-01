@@ -1,5 +1,6 @@
 mod claude;
 mod config;
+mod limit;
 mod telegram;
 
 use anyhow::Result;
@@ -18,6 +19,12 @@ use telegram::{Bot, Message};
 struct ChatState {
     session_id: Option<String>,
     work_dir: Option<PathBuf>,
+    /// Когда сам отправить «Продолжай» (unix-время, UTC): Claude упёрся в лимит.
+    #[serde(default)]
+    resume_at: Option<i64>,
+    /// То же время для человека: «01.11 10:41 Europe/Moscow».
+    #[serde(default)]
+    resume_label: Option<String>,
 }
 
 struct App {
@@ -83,6 +90,8 @@ async fn main() -> Result<()> {
         cfg,
     });
 
+    tokio::spawn(resume_scheduler(app.clone()));
+
     let mut offset = 0;
     loop {
         let updates = match app.bot.get_updates(offset).await {
@@ -134,17 +143,38 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
                     chat_id,
                     "Пиши задачу — я передам её Claude Code и пришлю ответ.\n\n\
                      /new — начать новую сессию\n\
-                     /cancel — прервать выполнение и очистить очередь\n\
+                     /cancel — прервать выполнение, очистить очередь и автопродолжение\n\
+                     /resume — когда продолжу сам после лимита\n\
                      /cwd [путь] — показать/сменить рабочую директорию (сбрасывает сессию)\n\
                      /status — текущая сессия и директория",
                 )
                 .await;
+        }
+        "/resume" => {
+            let state = app.chat_state(chat_id).await;
+            match state.resume_label {
+                Some(label) => {
+                    app.bot
+                        .send_text(chat_id, &format!("⏳ Продолжу сам: {label}. /cancel — отменить."))
+                        .await
+                }
+                None => app.bot.send_text(chat_id, "Автопродолжение не запланировано.").await,
+            }
         }
         "/new" => {
             app.update_chat(chat_id, |s| s.session_id = None).await;
             app.bot.send_text(chat_id, "🆕 Следующее сообщение начнёт новую сессию.").await;
         }
         "/cancel" => {
+            let had_resume = app.chat_state(chat_id).await.resume_at.is_some();
+            if had_resume {
+                app.update_chat(chat_id, |s| {
+                    s.resume_at = None;
+                    s.resume_label = None;
+                })
+                .await;
+                app.bot.send_text(chat_id, "⏹ Автопродолжение отменено.").await;
+            }
             let dropped = match app.running.lock().await.get_mut(&chat_id) {
                 Some(run) => {
                     run.cancel.notify_one();
@@ -157,7 +187,10 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
                     app.bot.send_text(chat_id, &format!("🗑 Очередь очищена ({n} сообщ.).")).await
                 }
                 Some(_) => {}
-                None => app.bot.send_text(chat_id, "Сейчас ничего не выполняется.").await,
+                None if !had_resume => {
+                    app.bot.send_text(chat_id, "Сейчас ничего не выполняется.").await
+                }
+                None => {}
             }
         }
         "/cwd" => {
@@ -186,7 +219,7 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
             let state = app.chat_state(chat_id).await;
             let queued = app.running.lock().await.get(&chat_id).map(|r| r.queue.len());
             let text = format!(
-                "Сессия: {}\nДиректория: {}\nВыполняется: {}",
+                "Сессия: {}\nДиректория: {}\nВыполняется: {}\nАвтопродолжение: {}",
                 state.session_id.as_deref().unwrap_or("нет"),
                 work_dir(app, chat_id).await.display(),
                 match queued {
@@ -194,6 +227,7 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
                     Some(n) => format!("да, в очереди {n}"),
                     None => "нет".to_string(),
                 },
+                state.resume_label.as_deref().unwrap_or("нет"),
             );
             app.bot.send_text(chat_id, &text).await;
         }
@@ -299,8 +333,58 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
                 log::info!("chat {chat_id}: turn finished, cost ${cost:.4}");
             }
             app.bot.send_text(chat_id, &text).await;
+            schedule_resume_if_limited(app, chat_id, &text).await;
         }
         Ok(Err(e)) => app.bot.send_text(chat_id, &format!("⚠️ Ошибка запуска claude: {e:#}")).await,
         Err(e) => app.bot.send_text(chat_id, &format!("⚠️ Внутренняя ошибка: {e}")).await,
+    }
+}
+
+/// Claude упёрся в лимит — запомнить, когда продолжить, и сказать об этом.
+async fn schedule_resume_if_limited(app: &Arc<App>, chat_id: i64, text: &str) {
+    let Some((at, label)) = limit::resume_at(text, chrono::Utc::now()) else { return };
+    let shown = label.clone();
+    app.update_chat(chat_id, |s| {
+        s.resume_at = Some(at.timestamp());
+        s.resume_label = Some(label);
+    })
+    .await;
+    log::info!("chat {chat_id}: limit hit, resume scheduled at {at}");
+    app.bot
+        .send_text(
+            chat_id,
+            &format!("⏳ Лимит исчерпан. Продолжу сам в {shown} — отправлю «Продолжай». /cancel — отменить."),
+        )
+        .await;
+}
+
+/// Раз в 20 секунд: чаты, которым пора продолжить после лимита.
+///
+/// Время хранится в файле состояния, поэтому перезапуск бота расписание не
+/// теряет: если момент прошёл, пока бот лежал, продолжение уйдёт сразу.
+async fn resume_scheduler(app: Arc<App>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(20));
+    loop {
+        ticker.tick().await;
+        let now = chrono::Utc::now().timestamp();
+        let due: Vec<i64> = app
+            .chats
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, s)| s.resume_at.is_some_and(|at| at <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        for chat_id in due {
+            app.update_chat(chat_id, |s| {
+                s.resume_at = None;
+                s.resume_label = None;
+            })
+            .await;
+            log::info!("chat {chat_id}: limit reset, resuming");
+            app.bot.send_text(chat_id, "⏰ Лимит обновился — продолжаю.").await;
+            let app = app.clone();
+            tokio::spawn(async move { run_claude(app, chat_id, "Продолжай".to_string()).await });
+        }
     }
 }
