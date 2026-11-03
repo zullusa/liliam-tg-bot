@@ -7,32 +7,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Notify};
 
+use crate::backend::{file_name, with_detail, Event, Outcome, SYSTEM_PROMPT};
 use crate::config::Config;
-
-const SYSTEM_PROMPT: &str = "You are talking with the user through a Telegram bot. \
-The user cannot see your tool calls, only your final text answer. The answer is rendered from \
-Markdown: headings, **bold**, *italic*, `inline code`, fenced code blocks, links, bullet lists and \
-> quotes are shown formatted; tables are flattened into lines, so prefer lists over tables. \
-Interactive tools that wait for user input are not available. If you need a decision or \
-clarification from the user, ask the question in your final answer and stop; the user's \
-reply will arrive as the next message in this same session. \
-Do not put shell commands, command lines, flags or code blocks into your answers: describe in \
-plain words what you did, why, and what came of it. Mention a file name only when it is needed \
-to understand the answer. \
-To send the user a file (an APK, a report, an image), run `claudetg send-file <path> [caption]`: \
-it delivers the file to this chat as a document (up to 50 MB).";
-
-pub enum Event {
-    /// Short progress note, e.g. which tool Claude is running.
-    Progress(String),
-}
-
-pub struct Outcome {
-    pub session_id: Option<String>,
-    pub text: String,
-    pub is_error: bool,
-    pub cost_usd: Option<f64>,
-}
 
 /// Runs one `claude -p` turn, resuming `session_id` if given.
 /// Progress events are sent to `events`; `cancel` aborts the run.
@@ -166,20 +142,7 @@ fn describe_tool(item: &Value) -> String {
         let raw = input.get(key).and_then(Value::as_str).unwrap_or("");
         raw.lines().next().unwrap_or("").chars().take(150).collect()
     };
-    let file = |key: &str| -> String {
-        let path = field(key);
-        Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or(path)
-    };
-    let with = |icon: &str, text: &str, detail: String| -> String {
-        if detail.is_empty() {
-            format!("{icon} {text}")
-        } else {
-            format!("{icon} {text}: {detail}")
-        }
-    };
+    let file = |key: &str| -> String { file_name(&field(key)) };
 
     match name {
         // У команды есть поле `description` — короткое объяснение словами.
@@ -192,18 +155,18 @@ fn describe_tool(item: &Value) -> String {
                 format!("⚙️ {description}")
             }
         }
-        "Read" => with("📖", "Читаю файл", file("file_path")),
-        "Write" => with("📝", "Создаю файл", file("file_path")),
-        "Edit" | "MultiEdit" => with("✏️", "Правлю файл", file("file_path")),
-        "NotebookEdit" => with("✏️", "Правлю блокнот", file("notebook_path")),
+        "Read" => with_detail("📖", "Читаю файл", file("file_path")),
+        "Write" => with_detail("📝", "Создаю файл", file("file_path")),
+        "Edit" | "MultiEdit" => with_detail("✏️", "Правлю файл", file("file_path")),
+        "NotebookEdit" => with_detail("✏️", "Правлю блокнот", file("notebook_path")),
         "Grep" | "Glob" => "🔍 Ищу по коду".into(),
-        "WebSearch" => with("🌐", "Ищу в интернете", field("query")),
+        "WebSearch" => with_detail("🌐", "Ищу в интернете", field("query")),
         "WebFetch" => {
             let url = field("url");
             let host = url.split("://").nth(1).unwrap_or(&url).split('/').next().unwrap_or("");
-            with("🌐", "Открываю страницу", host.to_string())
+            with_detail("🌐", "Открываю страницу", host.to_string())
         }
-        "Task" | "Agent" => with("🤖", "Поручаю часть работы помощнику", field("description")),
+        "Task" | "Agent" => with_detail("🤖", "Поручаю часть работы помощнику", field("description")),
         "TodoWrite" => "🗒 Обновляю план работы".into(),
         "Skill" => "📚 Загружаю инструкцию для задачи".into(),
         "ToolSearch" => "🧰 Подключаю нужный инструмент".into(),
