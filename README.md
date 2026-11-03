@@ -58,13 +58,19 @@ Telegram-бот, который передаёт сообщения coding-аг�
 ```sh
 cargo build --release
 install -Dm755 target/release/claudetg ~/.local/bin/claudetg
-install -Dm600 deploy/claudetg.env.example ~/.config/claudetg/claudetg.env   # затем отредактируй
+# конфиг службы не перезаписывай: в нём твой токен и твои id. Если файла ещё нет — скопируй пример,
+# а затем обязательно поменяй ALLOWED_USER_IDS: в примере заглушка 123456789, с ней бот молчит
+test -e ~/.config/claudetg/claudetg.env || install -Dm600 deploy/claudetg.env.example ~/.config/claudetg/claudetg.env
 install -Dm644 deploy/claudetg.service ~/.config/systemd/user/claudetg.service
 systemctl --user daemon-reload
 systemctl --user enable --now claudetg
 loginctl enable-linger $USER   # чтобы служба работала без активного входа в систему
 journalctl --user -u claudetg -f
 ```
+
+Бот запускается и с заглушкой в `ALLOWED_USER_IDS`, но игнорирует все сообщения: в журнале это
+выглядит как `ignored message from unauthorized user <id>`. Свой id подскажет @userinfobot, а при
+старте служба пишет, какие id ей разрешены.
 
 ## Права доступа
 `claude -p` не может спросить разрешение интерактивно, поэтому режим задаётся `CLAUDE_PERMISSION_MODE`:

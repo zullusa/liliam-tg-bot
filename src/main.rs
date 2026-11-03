@@ -174,11 +174,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let me = bot.get_me().await?;
+    let mut ids: Vec<String> = cfg.allowed_users.iter().map(i64::to_string).collect();
+    ids.sort();
     log::info!(
-        "started as @{} (proxy: {})",
+        "started as @{} (proxy: {}), allowed users: {}",
         me["username"].as_str().unwrap_or("?"),
-        cfg.proxy_url.as_deref().unwrap_or("none")
+        cfg.proxy_url.as_deref().unwrap_or("none"),
+        ids.join(", ")
     );
+    if cfg.allowed_users.iter().any(|id| *id == 123_456_789) {
+        log::warn!(
+            "ALLOWED_USER_IDS содержит 123456789 — это заглушка из deploy/claudetg.env.example; \
+             сообщения настоящих пользователей будут игнорироваться"
+        );
+    }
 
     let app = Arc::new(App {
         chats: Mutex::new(App::load_state(&cfg)),
