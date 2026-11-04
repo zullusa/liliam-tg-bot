@@ -1213,11 +1213,17 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
             record_turn(app, chat_id, logged_user, trunc(&text, 400), in_fallback).await;
             return schedule_resume_if_limited(app, chat_id, &text).await;
         }
-        Ok(Err(e)) => app
-            .bot
-            .send_text(chat_id, &format!("⚠️ Ошибка запуска {}: {e:#}", backend.name()))
-            .await,
-        Err(e) => app.bot.send_text(chat_id, &format!("⚠️ Внутренняя ошибка: {e}")).await,
+        // Ошибки смены тоже через очередь: если связи нет в этот момент,
+        // сообщение не потеряется, а уйдёт, когда связь вернётся.
+        Ok(Err(e)) => {
+            app.queue(chat_id, Kind::Answer, &format!("⚠️ Ошибка запуска {}: {e:#}", backend.name()))
+                .await;
+            app.drain_outbox(chat_id).await;
+        }
+        Err(e) => {
+            app.queue(chat_id, Kind::Answer, &format!("⚠️ Внутренняя ошибка: {e}")).await;
+            app.drain_outbox(chat_id).await;
+        }
     }
     false
 }
