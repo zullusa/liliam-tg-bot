@@ -5,6 +5,7 @@ mod handoff;
 mod limit;
 mod markdown;
 mod opencode;
+mod outbox;
 mod telegram;
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use backend::{Backend, Event};
 use config::Config;
 use handoff::Turn;
+use outbox::{Item, Kind, Policy, SentRecord};
 use telegram::{Bot, Message};
 
 /// Persisted per-chat state. Сессии у claude и opencode разные, поэтому
@@ -86,6 +88,11 @@ struct App {
     batches: Mutex<HashMap<i64, Batch>>,
     /// Предыдущее сообщение чата: последовательные повторы схлопываем в одно.
     last_text: Mutex<HashMap<i64, String>>,
+    /// Пузырь статуса на каждый чат: одно сообщение, которое бот правит на
+    /// протяжении задачи, вместо потока сообщений «выполняю команду».
+    status: Mutex<HashMap<i64, Bubble>>,
+    /// Последние отправленные в чат тексты — по ним отсекаем повторы.
+    recent_out: Mutex<HashMap<i64, Vec<String>>>,
 }
 
 struct Running {
@@ -100,6 +107,44 @@ struct Batch {
     first_at: tokio::time::Instant,
     /// Поколение окна: таймер старого поколения не закрывает обновлённое окно.
     gen: u64,
+}
+
+/// Пузырь статуса: единственное сообщение о том, чем сейчас занят агент. Бот
+/// создаёт его один раз на задачу и дальше правит — так в чате не появляется
+/// 9-20 сообщений в минуту.
+#[derive(Default)]
+struct Bubble {
+    message_id: Option<i64>,
+    /// Последняя строка: что агент делает сейчас.
+    line: String,
+    /// Сколько инструментов агент запустил и сколько служебных строк не ушло в чат.
+    actions: usize,
+    dropped: usize,
+    started: Option<tokio::time::Instant>,
+    /// Когда пузырь правили последний раз — чтобы не дёргать Telegram каждые 100 мс.
+    rendered: Option<tokio::time::Instant>,
+}
+
+impl Bubble {
+    /// Текст пузыря: строка о текущем действии плюс счётчики.
+    fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if self.actions > 0 {
+            parts.push(format!("действий: {}", self.actions));
+        }
+        if let Some(started) = self.started {
+            parts.push(format!("времени: {} с", started.elapsed().as_secs()));
+        }
+        if self.dropped > 0 {
+            parts.push(format!("служебных строк скрыто: {}", self.dropped));
+        }
+        let counter = parts.join(" · ");
+        if counter.is_empty() {
+            self.line.clone()
+        } else {
+            format!("{}\n{}", self.line, counter)
+        }
+    }
 }
 
 impl App {
@@ -133,6 +178,159 @@ impl App {
     async fn backend_of(&self, chat_id: i64) -> Backend {
         self.chat_state(chat_id).await.backend.unwrap_or(self.cfg.backend)
     }
+
+    /// Ставит текст в исходящую очередь: бот отправит его пачкой вместе с
+    /// другими сообщениями шага — так в чате не будет десятка сообщений подряд.
+    async fn queue(&self, chat_id: i64, kind: Kind, text: &str) {
+        if let Err(e) = outbox::enqueue(&self.cfg.outbox_dir, &Item::new(chat_id, kind, text)) {
+            log::error!("cannot queue a message for {chat_id}: {e}");
+            self.bot.send_markdown(chat_id, text).await;
+        }
+    }
+
+    /// Пузырь статуса: создаёт или правит одно сообщение чата.
+    async fn status(&self, chat_id: i64, line: &str) {
+        if !self.cfg.status_bubble {
+            return;
+        }
+        let (text, message_id) = {
+            let mut bubbles = self.status.lock().await;
+            let bubble = bubbles.entry(chat_id).or_default();
+            if !line.trim().is_empty() {
+                bubble.line = line.trim().to_string();
+            }
+            bubble.started.get_or_insert_with(tokio::time::Instant::now);
+            (bubble.render(), bubble.message_id)
+        };
+        let keep = if let Some(id) = message_id {
+            if self.bot.edit_text(chat_id, id, &text).await {
+                Some(id)
+            } else {
+                self.bot.send_text_ids(chat_id, &text).await.into_iter().next()
+            }
+        } else {
+            self.bot.send_text_ids(chat_id, &text).await.into_iter().next()
+        };
+        let mut bubbles = self.status.lock().await;
+        if let Some(bubble) = bubbles.get_mut(&chat_id) {
+            bubble.message_id = keep;
+            bubble.rendered = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// Строка о запущенном инструменте: только в пузырь статуса, в чат она не идёт.
+    async fn status_progress(&self, chat_id: i64, line: &str) {
+        if !self.cfg.status_bubble {
+            return;
+        }
+        let need = {
+            let mut bubbles = self.status.lock().await;
+            let bubble = bubbles.entry(chat_id).or_default();
+            bubble.actions += 1;
+            if bubble.line == line {
+                // то же действие повторяется — править сообщение незачем
+                false
+            } else {
+                bubble.line = line.to_string();
+                bubble
+                    .rendered
+                    .map(|t| t.elapsed() >= Duration::from_millis(1500))
+                    .unwrap_or(true)
+            }
+        };
+        if need {
+            self.status(chat_id, "").await;
+        }
+    }
+
+    /// Счётчик служебных строк, которые не ушли в чат.
+    async fn status_dropped(&self, chat_id: i64) {
+        self.status.lock().await.entry(chat_id).or_default().dropped += 1;
+    }
+
+    /// Задача кончилась: пузырь статуса убираем из чата, он больше не нужен.
+    async fn status_finish(&self, chat_id: i64) {
+        let bubble = self.status.lock().await.remove(&chat_id);
+        if let Some(bubble) = bubble {
+            if let Some(id) = bubble.message_id {
+                self.bot.delete(chat_id, id).await;
+            }
+        }
+    }
+
+    fn log_sent(&self, chat_id: i64, ids: &[i64], kind: Kind, text: &str) {
+        if ids.is_empty() {
+            return;
+        }
+        let preview: String = text.chars().take(160).collect();
+        let records: Vec<SentRecord> = ids
+            .iter()
+            .map(|id| SentRecord {
+                chat: chat_id,
+                message_id: *id,
+                ts: outbox::now_ms(),
+                kind,
+                preview: preview.clone(),
+            })
+            .collect();
+        if let Err(e) = outbox::append_sent(&self.cfg.sent_log, &records) {
+            log::warn!("cannot write {}: {e}", self.cfg.sent_log.display());
+        }
+    }
+
+    /// Отправляет всё, что накопилось в очереди чата: повторы и служебную
+    /// болтовню не отправляем, остальное склеиваем в одно сообщение.
+    async fn drain_outbox(&self, chat_id: i64) {
+        let all = outbox::pending(&self.cfg.outbox_dir);
+        let mine: Vec<(PathBuf, Item)> =
+            all.into_iter().filter(|(_, it)| it.chat == chat_id).collect();
+        if mine.is_empty() {
+            return;
+        }
+        outbox::discard(&mine.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+
+        let mut kept: Vec<String> = Vec::new();
+        let mut kind = Kind::Agent;
+        for (_, item) in &mine {
+            let text = item.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if item.kind == Kind::Answer {
+                kind = Kind::Answer;
+            }
+            if self.cfg.drop_chatter && outbox::is_chatter(text) {
+                log::info!("chat {chat_id}: служебная строка не отправлена: {text}");
+                self.status_dropped(chat_id).await;
+                continue;
+            }
+            {
+                let mut recent = self.recent_out.lock().await;
+                if outbox::is_repeat(text, recent.entry(chat_id).or_default()) {
+                    log::info!("chat {chat_id}: повтор не отправлен");
+                    self.status_dropped(chat_id).await;
+                    continue;
+                }
+            }
+            kept.push(text.to_string());
+        }
+        if kept.is_empty() {
+            return;
+        }
+        let merged = outbox::merge(&kept);
+        let ids = self.bot.send_markdown_ids(chat_id, &merged).await;
+        self.log_sent(chat_id, &ids, kind, &merged);
+        let mut recent = self.recent_out.lock().await;
+        let recent = recent.entry(chat_id).or_default();
+        for text in kept {
+            recent.push(text);
+        }
+        // помним последние 8 сообщений чата
+        if recent.len() > 8 {
+            let extra = recent.len() - 8;
+            recent.drain(0..extra);
+        }
+    }
 }
 
 #[tokio::main]
@@ -143,8 +341,9 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let bot = Bot::new(&cfg.bot_token, cfg.proxy_url.as_deref())?;
 
-    // `claudetg send <chat_id> < file.md` — отправить Markdown из stdin в чат и
-    // выйти, без опроса обновлений: проверка разметки и разовые сообщения.
+    // `claudetg send <chat_id> < file.md` — поставить Markdown в очередь чата и
+    // выйти: живой бот отправит её пачкой вместе с остальными сообщениями шага.
+    // Если бот не работает, отправляем сами — сообщение не должно пропасть.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("send") {
         let chat_id: i64 = args.get(2).and_then(|s| s.parse().ok()).ok_or_else(|| {
@@ -152,8 +351,19 @@ async fn main() -> Result<()> {
         })?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
-        bot.send_markdown(chat_id, &text).await;
+        if outbox::bot_alive(&cfg.pid_file) {
+            outbox::enqueue(&cfg.outbox_dir, &Item::new(chat_id, Kind::Agent, text))?;
+            log::info!("сообщение поставлено в очередь: {}", cfg.outbox_dir.display());
+        } else {
+            log::warn!("бот не работает ({}), отправляем напрямую", cfg.pid_file.display());
+            bot.send_markdown(chat_id, &text).await;
+        }
         return Ok(());
+    }
+    // `claudetg clean [--chat <id>] [--all] [--keep N] [--dry]` — убрать из чата
+    // свои сообщения по журналу отправленного.
+    if args.get(1).map(String::as_str) == Some("clean") {
+        return clean_messages(&bot, &cfg, &args[2..]).await;
     }
     // `claudetg send-file <path> [подпись]` — прислать файл документом в чат
     // CLAUDETG_CHAT_ID (бот выставляет его процессу claude) или --chat <id>.
@@ -194,10 +404,25 @@ async fn main() -> Result<()> {
         running: Mutex::new(HashMap::new()),
         batches: Mutex::new(HashMap::new()),
         last_text: Mutex::new(HashMap::new()),
+        status: Mutex::new(HashMap::new()),
+        recent_out: Mutex::new(HashMap::new()),
         bot,
         cfg,
     });
 
+    // Pid-файл: по нему `claudetg send` понимает, что очередь разберёт бот.
+    outbox::write_pid(&app.cfg.pid_file)?;
+    log::info!(
+        "очередь исходящих: {} (тишина {} с, максимум {} с и {} сообщ.), отсекаем болтовню: {}",
+        app.cfg.outbox_dir.display(),
+        app.cfg.send_quiet_secs,
+        app.cfg.send_max_secs,
+        app.cfg.send_max_items,
+        app.cfg.drop_chatter
+    );
+    log::info!("вложения из чата сохраняем в {}", app.cfg.attach_dir.display());
+
+    tokio::spawn(flush_outbox(app.clone()));
     tokio::spawn(resume_scheduler(app.clone()));
 
     let mut offset = 0;
@@ -227,11 +452,31 @@ async fn handle_message(app: Arc<App>, msg: Message) {
         log::warn!("ignored message from unauthorized user {user_id} in chat {chat_id}");
         return;
     }
-    let Some(text) = msg.text.or(msg.caption) else {
-        app.bot.send_text(chat_id, "Пока понимаю только текст.").await;
+    // Сначала вложения: человек прислал файл — качаем и отдаём агенту локальный путь.
+    let files = save_attachments(&app, chat_id, &msg).await;
+    let text = msg.text.or(msg.caption).unwrap_or_default().trim().to_string();
+    if text.is_empty() && files.is_empty() {
+        app.bot.send_text(chat_id, "Пока понимаю только текст и файлы.").await;
         return;
-    };
-    let text = text.trim().to_string();
+    }
+    if text.is_empty() {
+        let listed = list_files(&files);
+        submit_text(
+            &app,
+            chat_id,
+            format!(
+                "Пользователь прислал файл(ы). Они уже скачаны, локальные пути:\n{listed}\n\
+                 Открой их и разберись, что там: коротко опиши содержание и спроси, что с ними сделать."
+            ),
+        )
+        .await;
+        return;
+    }
+    if !files.is_empty() {
+        let listed = list_files(&files);
+        submit_text(&app, chat_id, format!("{text}\n\nФайлы от пользователя (уже скачаны):\n{listed}")).await;
+        return;
+    }
 
     if text.starts_with('/') {
         let (cmd, arg) = text.split_once(char::is_whitespace).unwrap_or((&text, ""));
@@ -243,14 +488,113 @@ async fn handle_message(app: Arc<App>, msg: Message) {
     submit_text(&app, chat_id, text).await;
 }
 
+/// Строки со списком скачанных файлов: путь, имя, тип и размер.
+fn list_files(files: &[telegram::Attachment]) -> String {
+    files
+        .iter()
+        .map(|f| {
+            format!(
+                "· {} — {}, {}, {}",
+                f.local.display(),
+                f.name,
+                f.kind,
+                human_size(f.size)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Скачивает вложения сообщения в каталог бота. Неудачу поясняет в чате одной
+/// строкой; возвращает то, что удалось сохранить.
+async fn save_attachments(app: &Arc<App>, chat_id: i64, msg: &Message) -> Vec<telegram::Attachment> {
+    let mut saved = Vec::new();
+    for file in msg.attachments() {
+        let kind = match file.mime_type.as_deref().map(|m| m.split('/').next().unwrap_or("")) {
+            Some("image") => "изображение",
+            Some("audio") => "аудио",
+            Some("video") => "видео",
+            _ if file.width.is_some() => "изображение",
+            _ if file.file_name.is_some() => "документ",
+            _ => "файл",
+        };
+        let name = file.file_name.clone().unwrap_or_else(|| "файл".into());
+        let limit = app.cfg.attach_max_mb * 1024 * 1024;
+        if app.cfg.attach_max_mb > 0 && file.file_size.unwrap_or(0) > limit {
+            app.bot
+                .send_text(
+                    chat_id,
+                    &format!(
+                        "Файл «{name}» больше лимита {} МиБ — не скачиваю; пришли его, пожалуйста, ссылкой.",
+                        app.cfg.attach_max_mb
+                    ),
+                )
+                .await;
+            continue;
+        }
+        let base = telegram::safe_name(file.file_name.as_deref(), &format!("file-{}", msg.id));
+        let local = unique_path(&app.cfg.attach_dir, msg.id, &base);
+        match app.bot.download(file, &local).await {
+            Ok(size) => {
+                let dims = match (file.width, file.height) {
+                    (Some(w), Some(h)) => format!(", {w}×{h}"),
+                    _ => String::new(),
+                };
+                log::info!("chat {chat_id}: {kind} {base} ({size} байт{dims}) → {}", local.display());
+                saved.push(telegram::Attachment { local, name: base, kind, size });
+            }
+            Err(e) => {
+                log::warn!("chat {chat_id}: не скачали {kind} {base}: {e:#}");
+                app.bot
+                    .send_text(chat_id, &format!("Не скачал {kind} «{name}»: {e:#}"))
+                    .await;
+            }
+        }
+    }
+    saved
+}
+
+/// Имя файла в каталоге вложений: добавляем id сообщения, чтобы не затирать
+/// прежние загрузки, и счётчик, если такое имя уже занято.
+fn unique_path(dir: &std::path::Path, message_id: i64, name: &str) -> PathBuf {
+    let first = dir.join(format!("{message_id}-{name}"));
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut n = 2;
+    loop {
+        let candidate = dir.join(format!("{message_id}-{stem}-{n}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Размер по-человечески: байты, КиБ, МиБ.
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    if bytes < KB {
+        format!("{bytes} байт")
+    } else if bytes < 1024 * KB {
+        format!("{:.1} КиБ", bytes as f64 / KB as f64)
+    } else {
+        format!("{:.1} МиБ", bytes as f64 / (1024.0 * KB as f64))
+    }
+}
+
 /// Принять текстовое сообщение: одинаковые подряд схлопываем в одно, остальные
 /// копим окном агрегации — человек печатает задачу частями, запускаем одной
 /// задачей после тишины (но не дольше предельного окна от первой части).
 async fn submit_text(app: &Arc<App>, chat_id: i64, text: String) {
     if app.last_text.lock().await.get(&chat_id).map(String::as_str) == Some(text.as_str()) {
-        app.bot
-            .send_text(chat_id, "🔁 Такой же текст уже принят — вторым сообщением его не повторяю.")
-            .await;
+        // Тот же текст второй раз подряд — случайная повторная отправка.
+        // Отвечать отдельным сообщением не будем: это лишний шум в чате.
+        log::info!("chat {chat_id}: тот же текст подряд — не запускаем второй раз");
         return;
     }
     app.last_text.lock().await.insert(chat_id, text.clone());
@@ -280,14 +624,9 @@ async fn submit_text(app: &Arc<App>, chat_id: i64, text: String) {
             .saturating_duration_since(tokio::time::Instant::now())
     };
     if first {
-        app.bot
-            .send_text(
-                chat_id,
-                &format!(
-                    "🕐 Задача принята. Можно дополнять ещё {quiet} с после каждого сообщения \
-                     (всего не дольше {cap} с) — запущу всё одной задачей.",
-                ),
-            )
+        // Не отдельное сообщение, а строка в пузыре статуса: её видно, пока бот
+        // ждёт дополнений, и в чате она не остаётся.
+        app.status(chat_id, &format!("Задача принята, жду дополнения ещё {quiet} с"))
             .await;
     }
     let app = app.clone();
@@ -347,11 +686,16 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
                      максимум {c} с. Повтор того же текста подряд не дублирую.\n\n"
                 )
             };
+            let attach = app.cfg.attach_dir.display().to_string();
             app.bot
                 .send_text(
                     chat_id,
                     &format!(
                         "Пиши задачу — я передам её агенту и пришлю ответ.\n\n{agg}\
+                         Файлы из чата скачиваю в {attach} — агент читает их оттуда.\n\
+                         Сообщения в чат склеиваю: несколько коротких за один шаг приходят \
+                         одним сообщением, повторы и «выполняю команду» в чат не уходят. \
+                         Пока агент работает, в чате одна живая строка о том, что он делает.\n\n\
                          /new — начать новую сессию\n\
                          /backend [claude|opencode] — показать или сменить агента\n\
                          /cancel — прервать выполнение, очистить очередь и автопродолжение\n\
@@ -583,8 +927,7 @@ async fn run_agent(app: Arc<App>, chat_id: i64, prompt: String) {
             run.queue.push(prompt);
             let n = run.queue.len();
             drop(running);
-            app.bot
-                .send_text(chat_id, &format!("📥 В очереди ({n}). Отправлю после текущей задачи; /cancel — прервать и очистить."))
+            app.status(chat_id, &format!("Сообщение в очереди ({n}): выполню после текущей задачи"))
                 .await;
             return;
         }
@@ -602,6 +945,9 @@ async fn run_agent(app: Arc<App>, chat_id: i64, prompt: String) {
         }
         if run.queue.is_empty() {
             running.remove(&chat_id);
+            drop(running);
+            // Задача кончилась: пузырь статуса убираем из чата, он больше не нужен.
+            app.status_finish(chat_id).await;
             return;
         }
         let queued = std::mem::take(&mut run.queue);
@@ -609,13 +955,103 @@ async fn run_agent(app: Arc<App>, chat_id: i64, prompt: String) {
         run.cancel = cancel.clone();
         let lines = queued
             .iter()
-            .map(|t| format!("▶️ Следующая задача из очереди: {}", brief(t, 120)))
+            .map(|t| format!("· {}", brief(t, 120)))
             .collect::<Vec<_>>()
             .join("\n");
         drop(running);
-        app.bot.send_text(chat_id, &lines).await;
+        app.status(chat_id, &format!("Беру следующую задачу из очереди:\n{lines}"))
+            .await;
         prompt = queued.join("\n\n");
     }
+}
+
+/// Раз в секунду смотрит исходящую очередь: чат замолчал на `quiet` секунд,
+/// или накопилось `max_items` сообщений, или прошло `max_secs` от первого —
+/// отправляем накопленное одним сообщением.
+async fn flush_outbox(app: Arc<App>) {
+    let policy = Policy {
+        quiet: Duration::from_secs(app.cfg.send_quiet_secs),
+        max: Duration::from_secs(app.cfg.send_max_secs),
+        max_items: app.cfg.send_max_items,
+    };
+    let mut ticker = tokio::time::interval(Duration::from_millis(700));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let items = outbox::pending(&app.cfg.outbox_dir);
+        if items.is_empty() {
+            continue;
+        }
+        for chat in outbox::due_chats(&items, outbox::now_ms(), &policy) {
+            app.drain_outbox(chat).await;
+        }
+    }
+}
+
+/// `claudetg clean [--chat <id>] [--all] [--keep N] [--dry]` — убирает из чата
+/// свои же сообщения по журналу отправленного: служебные заметки и болтовню
+/// (по умолчанию) или всё подряд (--all). Последние N сообщений (--keep, по
+/// умолчанию 5) не трогаем. Чужие сообщения бот не удаляет: в личной переписке
+/// Telegram этого не разрешает.
+async fn clean_messages(bot: &Bot, cfg: &Config, args: &[String]) -> Result<()> {
+    let usage = "usage: claudetg clean [--chat <id>] [--all] [--keep N] [--dry]";
+    let mut chat = std::env::var("CLAUDETG_CHAT_ID").ok();
+    if let Some(i) = args.iter().position(|a| a == "--chat") {
+        chat = args.get(i + 1).cloned();
+    }
+    let chat_id: i64 = chat
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("{usage}: чат не задан (--chat <id> или CLAUDETG_CHAT_ID)"))?;
+    let all = args.iter().any(|a| a == "--all");
+    let dry = args.iter().any(|a| a == "--dry");
+    let keep: usize = args
+        .iter()
+        .position(|a| a == "--keep")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    let records = outbox::read_sent(&cfg.sent_log);
+    let mine: Vec<_> = records.iter().filter(|r| r.chat == chat_id).cloned().collect();
+    let targets = outbox::clean_targets(&mine, keep, !all);
+    println!(
+        "в журнале {} из {} своих сообщений в чат {chat_id}{}",
+        targets.len(),
+        mine.len(),
+        if dry { " — пробный прогон, ничего не удаляем" } else { "" }
+    );
+    if targets.is_empty() {
+        println!(
+            "чистить нечего: журнал {} пуст или все сообщения помечены как последние",
+            cfg.sent_log.display()
+        );
+        return Ok(());
+    }
+    let mut deleted = 0usize;
+    let mut handled = Vec::new();
+    for r in &targets {
+        if dry {
+            println!("удалим: сообщение {} — {}", r.message_id, r.preview.replace('\n', " "));
+            continue;
+        }
+        if bot.delete(chat_id, r.message_id).await {
+            deleted += 1;
+        }
+        // Сообщение мог удалить человек или Telegram (слишком старое) — запись
+        // из журнала убираем в любом случае, иначе она повиснет навсегда.
+        handled.push(r.message_id);
+    }
+    if !dry {
+        let removed: std::collections::HashSet<i64> = handled.into_iter().collect();
+        let rest: Vec<_> = records
+            .iter()
+            .filter(|r| !(r.chat == chat_id && removed.contains(&r.message_id)))
+            .cloned()
+            .collect();
+        outbox::write_sent(&cfg.sent_log, &rest)?;
+        println!("удалено {deleted} из {}; в журнале осталось {} записей", targets.len(), rest.len());
+    }
+    Ok(())
 }
 
 async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Notify>) -> bool {
@@ -650,27 +1086,20 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
         })
     };
 
-    // While the agent works: keep the "typing…" indicator alive and batch tool
-    // notifications into one message every few seconds.
+    // Пока агент работает: держим индикатор «печатает…» и одну живую строку о том,
+    // что он делает сейчас. Отдельных сообщений про каждый инструмент не будет.
     let mut ticker = tokio::time::interval(Duration::from_secs(4));
-    let mut progress: Vec<String> = Vec::new();
     loop {
         tokio::select! {
             ev = rx.recv() => match ev {
-                Some(Event::Progress(p)) => progress.push(p),
+                Some(Event::Progress(p)) => app.status_progress(chat_id, &p).await,
                 None => break,
             },
             _ = ticker.tick() => {
-                if app.cfg.show_tools && !progress.is_empty() {
-                    app.bot.send_text(chat_id, &progress.join("\n")).await;
-                    progress.clear();
-                }
+                app.status(chat_id, "").await;
                 app.bot.send_typing(chat_id).await;
             }
         }
-    }
-    if app.cfg.show_tools && !progress.is_empty() {
-        app.bot.send_text(chat_id, &progress.join("\n")).await;
     }
 
     match run.await {
@@ -685,7 +1114,10 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
             if let Some(cost) = outcome.cost_usd {
                 log::info!("chat {chat_id}: {backend_name} turn finished, cost ${cost:.4}", backend_name = backend.name());
             }
-            app.bot.send_markdown(chat_id, &text).await;
+            // Ответ идёт через очередь: всё, что агент написал по пути через
+            // `claudetg send`, склеится с ним в одно сообщение.
+            app.queue(chat_id, Kind::Answer, &text).await;
+            app.drain_outbox(chat_id).await;
             record_turn(app, chat_id, logged_user, trunc(&text, 400), in_fallback).await;
             return schedule_resume_if_limited(app, chat_id, &text).await;
         }
@@ -844,6 +1276,49 @@ async fn resume_scheduler(app: Arc<App>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bubble_shows_line_and_counters() {
+        let bubble = Bubble {
+            line: "Читаю файл: main.rs".into(),
+            actions: 3,
+            dropped: 2,
+            started: None,
+            rendered: None,
+            message_id: None,
+        };
+        let text = bubble.render();
+        assert!(text.starts_with("Читаю файл: main.rs"));
+        assert!(text.contains("действий: 3"));
+        assert!(text.contains("служебных строк скрыто: 2"));
+        // пустой пузырь не плодит лишних строк
+        assert_eq!(Bubble::default().render(), "");
+    }
+
+    #[test]
+    fn attachment_names_get_message_id_and_counter() {
+        let dir = std::env::temp_dir().join(format!("claudetg-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_path(&dir, 7, "отчёт.pdf");
+        assert_eq!(first.file_name().unwrap().to_str().unwrap(), "7-отчёт.pdf");
+        std::fs::write(&first, "раз").unwrap();
+        let second = unique_path(&dir, 7, "отчёт.pdf");
+        assert_eq!(second.file_name().unwrap().to_str().unwrap(), "7-отчёт-2.pdf");
+        // файл без расширения
+        std::fs::write(dir.join("9-лог"), "x").unwrap();
+        assert_eq!(
+            unique_path(&dir, 9, "лог").file_name().unwrap().to_str().unwrap(),
+            "9-лог-2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sizes_are_readable() {
+        assert_eq!(human_size(512), "512 байт");
+        assert_eq!(human_size(2048), "2.0 КиБ");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 МиБ");
+    }
 
     #[test]
     fn brief_folds_spaces_and_truncates() {

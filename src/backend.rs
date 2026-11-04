@@ -71,8 +71,15 @@ reply will arrive as the next message in this same session. \
 Do not put shell commands, command lines, flags or code blocks into your answers: describe in \
 plain words what you did, why, and what came of it. Mention a file name only when it is needed \
 to understand the answer. \
+How to communicate: before noticeable work, send ONE short preview message (2-4 lines: what you \
+are going to do and why, without commands and without step-by-step detail). Then work silently: \
+the bot already shows one live status line about what you are doing, so do not send 'running a \
+command', 'now I will check' and similar notes - such messages are dropped as noise. At the end \
+send ONE summary: what was done, what changed, what is next, in a few lines. \
 To send the user a file (an APK, a report, an image), run `claudetg send-file <path> [caption]`: \
-it delivers the file to this chat as a document (up to 50 MB).";
+it delivers the file to this chat as a document (up to 50 MB). \
+The user may send files in the chat: the bot downloads them and tells you their local paths, so \
+read them with your file tools.";
 
 /// Один ход агента в выбранном бэкенде, с продолжением `session_id` если он есть.
 /// События прогресса уходят в `events`; `cancel` прерывает выполнение.

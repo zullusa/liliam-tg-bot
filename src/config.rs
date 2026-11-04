@@ -28,8 +28,27 @@ pub struct Config {
     /// инструменты, как claude без permission mode.
     pub opencode_auto: bool,
     pub opencode_extra_args: Vec<String>,
-    pub show_tools: bool,
+    /// Пузырь статуса в чате: одно сообщение, которое бот обновляет вместо
+    /// потока «выполняю команду». Показывается ли он — `status_bubble`.
+    pub status_bubble: bool,
     pub state_file: PathBuf,
+    /// Каталог исходящей очереди (`claudetg send` и ответы агента складываются
+    /// туда, бот отправляет их пачкой — меньше сообщений в чате).
+    pub outbox_dir: PathBuf,
+    /// Журнал «что бот отправил в чат» — по нему команда `claudetg clean`
+    /// удаляет свои сообщения.
+    pub sent_log: PathBuf,
+    /// Pid-файл работающего бота: без него `claudetg send` шлёт сразу.
+    pub pid_file: PathBuf,
+    /// Окно склейки исходящих сообщений: тишина после последнего и предельный срок.
+    pub send_quiet_secs: u64,
+    pub send_max_secs: u64,
+    pub send_max_items: usize,
+    /// Не отправлять в чат служебную болтовню вида «выполняю команду».
+    pub drop_chatter: bool,
+    /// Куда сохранять вложения из чата и сколько скачивать.
+    pub attach_dir: PathBuf,
+    pub attach_max_mb: u64,
     /// При лимите Claude передавать контекст opencode и работать им до сброса лимита.
     pub limit_fallback: bool,
     /// Где Claude Code хранит JSONL-сессии (для расшифровки контекста).
@@ -45,6 +64,14 @@ fn var(name: &str) -> Option<String> {
 }
 
 impl Config {
+    /// Соседний файл рядом с состоянием бота: `state/outbox`, `state/sent.jsonl`.
+    fn sibling(state_file: &std::path::Path, name: &str) -> PathBuf {
+        state_file
+            .parent()
+            .map(|dir| dir.join(name))
+            .unwrap_or_else(|| PathBuf::from(name))
+    }
+
     pub fn from_env() -> Result<Self> {
         let bot_token = var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN is not set")?;
 
@@ -98,8 +125,33 @@ impl Config {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
             opencode_extra_args: split_args(var("OPENCODE_EXTRA_ARGS")),
-            show_tools: var("SHOW_TOOLS").map(|v| v == "1" || v == "true").unwrap_or(true),
-            state_file,
+            // SHOW_TOOLS=0 — совсем без пузыря статуса; по умолчанию одна живая
+            // строка о том, чем занят агент, вместо потока сообщений.
+            status_bubble: var("SHOW_TOOLS")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            state_file: state_file.clone(),
+            outbox_dir: Self::sibling(&state_file, "outbox"),
+            sent_log: Self::sibling(&state_file, "sent.jsonl"),
+            pid_file: Self::sibling(&state_file, "bot.pid"),
+            send_quiet_secs: var("CLAUDETG_SEND_QUIET_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(7),
+            send_max_secs: var("CLAUDETG_SEND_MAX_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25),
+            send_max_items: var("CLAUDETG_SEND_MAX_ITEMS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4usize),
+            drop_chatter: var("CLAUDETG_DROP_CHATTER")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            attach_dir: var("CLAUDETG_ATTACH_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("Downloads/claudetg")),
+            attach_max_mb: var("CLAUDETG_ATTACH_MAX_MB")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
             limit_fallback: var("CLAUDETG_LIMIT_FALLBACK")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
@@ -120,4 +172,45 @@ fn split_args(value: Option<String>) -> Vec<String> {
     value
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn side_files_live_next_to_the_state() {
+        let state = PathBuf::from("/home/u/.local/state/claudetg/state.json");
+        assert_eq!(
+            Config::sibling(&state, "outbox"),
+            PathBuf::from("/home/u/.local/state/claudetg/outbox")
+        );
+        assert_eq!(
+            Config::sibling(&state, "sent.jsonl"),
+            PathBuf::from("/home/u/.local/state/claudetg/sent.jsonl")
+        );
+        // у состояния нет каталога — кладём рядом с именем
+        assert_eq!(Config::sibling(Path::new("state.json"), "bot.pid"), PathBuf::from("bot.pid"));
+    }
+
+    #[test]
+    fn reads_settings_from_environment() {
+        // переменные задаём в одном процессе последовательно, чтобы не мешать
+        // другим тестам: берём редкие имена и проверяем разбор чисел
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        std::env::set_var("ALLOWED_USER_IDS", "7, 8");
+        std::env::set_var("CLAUDETG_SEND_QUIET_SECS", "3");
+        std::env::set_var("CLAUDETG_SEND_MAX_ITEMS", "9");
+        std::env::set_var("CLAUDETG_DROP_CHATTER", "0");
+        std::env::set_var("SHOW_TOOLS", "0");
+        std::env::set_var("STATE_FILE", "/tmp/claudetg-test/state.json");
+        let cfg = super::Config::from_env().unwrap();
+        assert_eq!(cfg.allowed_users.len(), 2);
+        assert_eq!(cfg.send_quiet_secs, 3);
+        assert_eq!(cfg.send_max_items, 9);
+        assert!(!cfg.drop_chatter);
+        assert!(!cfg.status_bubble);
+        assert_eq!(cfg.outbox_dir, PathBuf::from("/tmp/claudetg-test/outbox"));
+    }
 }
