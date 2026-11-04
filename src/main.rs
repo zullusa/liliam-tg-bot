@@ -207,10 +207,10 @@ impl App {
             if self.bot.edit_text(chat_id, id, &text).await {
                 Some(id)
             } else {
-                self.bot.send_text_ids(chat_id, &text).await.into_iter().next()
+                self.bot.send_text_ids(chat_id, &text).await.unwrap_or_default().into_iter().next()
             }
         } else {
-            self.bot.send_text_ids(chat_id, &text).await.into_iter().next()
+            self.bot.send_text_ids(chat_id, &text).await.unwrap_or_default().into_iter().next()
         };
         let mut bubbles = self.status.lock().await;
         if let Some(bubble) = bubbles.get_mut(&chat_id) {
@@ -288,8 +288,8 @@ impl App {
         if mine.is_empty() {
             return;
         }
-        outbox::discard(&mine.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
-
+        // Файлы очереди убираем только после отправки: сетевой сбой не должен
+        // съедать сообщение — оно дойдёт, когда связь вернётся.
         let mut kept: Vec<String> = Vec::new();
         let mut kind = Kind::Agent;
         for (_, item) in &mine {
@@ -316,11 +316,20 @@ impl App {
             kept.push(text.to_string());
         }
         if kept.is_empty() {
+            outbox::discard(&mine.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
             return;
         }
         let merged = outbox::merge(&kept);
-        let ids = self.bot.send_markdown_ids(chat_id, &merged).await;
-        self.log_sent(chat_id, &ids, kind, &merged);
+        match self.bot.send_markdown_ids(chat_id, &merged).await {
+            Ok(ids) => {
+                outbox::discard(&mine.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+                self.log_sent(chat_id, &ids, kind, &merged);
+            }
+            Err(e) => {
+                log::warn!("chat {chat_id}: сообщение не отправлено ({e:#}), ждём связи");
+                return;
+            }
+        }
         let mut recent = self.recent_out.lock().await;
         let recent = recent.entry(chat_id).or_default();
         for text in kept {

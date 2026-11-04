@@ -11,9 +11,37 @@ const MAX_MESSAGE_CHARS: usize = 3900;
 #[derive(Clone)]
 pub struct Bot {
     client: reqwest::Client,
+    /// Запасной маршрут: если задан прокси, здесь прямой клиент (и наоборот).
+    /// Прокси к Telegram иногда «зависает» на CONNECT, а прямой путь работает.
+    fallback: Option<reqwest::Client>,
     base: String,
     /// Токен нужен и для вызовов методов, и для загрузки файлов (`/file/bot<token>/…`).
     token: String,
+}
+
+/// Telegram принял запрос, но отказал по делу: неверный текст, лимит, права.
+/// Такое повторять бесполезно — в отличие от сетевой неполадки.
+#[derive(Debug)]
+struct ApiRejected(String);
+
+impl std::fmt::Display for ApiRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ApiRejected {}
+
+/// Не удалось соединиться (или запрос оборвался на транспорте): запрос не ушёл,
+/// повторять безопасно.
+fn is_connect_err(e: &reqwest::Error) -> bool {
+    e.is_connect()
+}
+
+/// Повторять ли отправку: отказ Telegram по существу повторяют зря, сетевую
+/// неполадку — нужно.
+fn retryable(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ApiRejected>().is_none()
 }
 
 #[derive(Deserialize)]
@@ -107,38 +135,82 @@ pub struct User {
 
 impl Bot {
     pub fn new(token: &str, proxy: Option<&str>) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            // Must exceed the long-polling timeout used in get_updates.
-            .timeout(Duration::from_secs(90));
-        if let Some(p) = proxy {
-            builder = builder.proxy(reqwest::Proxy::all(p)?);
-        } else {
-            builder = builder.no_proxy();
-        }
+        let builder = || {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(20))
+                // Must exceed the long-polling timeout used in get_updates.
+                .timeout(Duration::from_secs(90))
+        };
+        // Основной клиент — как настроено, запасной — другой маршрут: прокси к
+        // Telegram иногда зависает на CONNECT, а прямой путь в это время работает.
+        let (client, fallback) = match proxy {
+            Some(p) => (
+                builder().proxy(reqwest::Proxy::all(p)?).build()?,
+                Some(builder().no_proxy().build()?),
+            ),
+            None => (builder().no_proxy().build()?, None),
+        };
         Ok(Self {
-            client: builder.build()?,
+            client,
+            fallback,
             base: format!("https://api.telegram.org/bot{token}"),
             token: token.to_string(),
         })
     }
 
-    async fn call<T: DeserializeOwned>(&self, method: &str, body: Value) -> Result<T> {
-        let resp: ApiResponse<T> = self
-            .client
-            .post(format!("{}/{method}", self.base))
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        match (resp.ok, resp.result) {
-            (true, Some(r)) => Ok(r),
-            _ => bail!(
-                "{method} failed: {}",
-                resp.description.unwrap_or_else(|| "unknown error".into())
-            ),
+    /// Маршруты обхода: сначала настроенный, потом запасной.
+    fn routes(&self) -> Vec<&reqwest::Client> {
+        let mut out = vec![&self.client];
+        if let Some(f) = &self.fallback {
+            out.push(f);
         }
+        out
+    }
+
+    async fn call<T: DeserializeOwned>(&self, method: &str, body: Value) -> Result<T> {
+        let url = format!("{}/{method}", self.base);
+        let mut last: Option<reqwest::Error> = None;
+        for client in self.routes() {
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    let resp: ApiResponse<T> = resp.json().await?;
+                    return match (resp.ok, resp.result) {
+                        (true, Some(r)) => Ok(r),
+                        _ => Err(ApiRejected(format!(
+                            "{method} failed: {}",
+                            resp.description.unwrap_or_else(|| "unknown error".into())
+                        ))
+                        .into()),
+                    };
+                }
+                Err(e) if is_connect_err(&e) => {
+                    log::debug!("{method}: маршрут не дошёл, пробуем следующий: {e}");
+                    last = Some(e);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(last
+            .map(anyhow::Error::new)
+            .unwrap_or_else(|| anyhow::anyhow!("{method}: нет сетевого маршрута")))
+    }
+
+    /// Отправка сообщения с повторами: сетевой сбой не должен обрывать
+    /// переписку. Отказ по существу (лимит, неверный текст) не повторяем.
+    async fn call_send(&self, method: &str, body: Value) -> Result<Value> {
+        for attempt in 1..=3u32 {
+            match self.call::<Value>(method, body.clone()).await {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt == 3 || !retryable(&e) => {
+                    return Err(e)
+                }
+                Err(e) => {
+                    log::warn!("{method}: не отправлено, попытка {attempt} из 3: {e:#}");
+                    tokio::time::sleep(Duration::from_millis(1200 * u64::from(attempt))).await;
+                }
+            }
+        }
+        unreachable!()
     }
 
     pub async fn get_me(&self) -> Result<Value> {
@@ -171,12 +243,14 @@ impl Bot {
     }
 
     /// То же, но возвращает id отправленных сообщений — по ним чистим чат.
-    pub async fn send_text_ids(&self, chat_id: i64, text: &str) -> Vec<i64> {
+    /// Ошибка приходит только если не ушло ни одной части: тогда очередь
+    /// остаётся целой и сообщение дойдёт позже.
+    pub async fn send_text_ids(&self, chat_id: i64, text: &str) -> Result<Vec<i64>> {
         let text = if text.trim().is_empty() { "(пустой ответ)" } else { text };
         let mut ids = Vec::new();
         for chunk in split_message(text, MAX_MESSAGE_CHARS) {
-            let res: Result<Value> = self
-                .call("sendMessage", json!({ "chat_id": chat_id, "text": chunk }))
+            let res = self
+                .call_send("sendMessage", json!({ "chat_id": chat_id, "text": chunk }))
                 .await;
             match res {
                 Ok(v) => {
@@ -184,10 +258,14 @@ impl Bot {
                         ids.push(id);
                     }
                 }
-                Err(e) => log::error!("sendMessage to {chat_id}: {e:#}"),
+                Err(e) if ids.is_empty() => {
+                    log::error!("sendMessage to {chat_id}: {e:#}");
+                    return Err(e);
+                }
+                Err(e) => log::error!("sendMessage to {chat_id}: часть сообщения не ушла: {e:#}"),
             }
         }
-        ids
+        Ok(ids)
     }
 
     /// Правит своё же сообщение (new message_id тот же). Возвращает false, если
@@ -329,28 +407,46 @@ impl Bot {
         if bytes.len() > 50 * 1024 * 1024 {
             bail!("{name}: больше 50 МБ — Telegram не примет");
         }
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", reqwest::multipart::Part::bytes(bytes).file_name(name));
-        if let Some(c) = caption {
-            form = form.text("caption", c.to_string());
+        // Файл идёт долго, поэтому маршрутом тоже перебираем: зависший прокси
+        // не должен стоить доставки APK.
+        let mut last: Option<reqwest::Error> = None;
+        for client in self.routes() {
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .part(
+                    "document",
+                    reqwest::multipart::Part::bytes(bytes.clone()).file_name(name.clone()),
+                );
+            if let Some(c) = caption {
+                form = form.text("caption", c.to_string());
+            }
+            let send = client
+                .post(format!("{}/sendDocument", self.base))
+                .multipart(form)
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await;
+            match send {
+                Ok(resp) => {
+                    let resp: ApiResponse<Value> = resp.json().await?;
+                    if !resp.ok {
+                        bail!(
+                            "sendDocument failed: {}",
+                            resp.description.unwrap_or_else(|| "unknown error".into())
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) if is_connect_err(&e) => {
+                    log::debug!("sendDocument: маршрут не дошёл, пробуем следующий: {e}");
+                    last = Some(e);
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        let resp: ApiResponse<Value> = self
-            .client
-            .post(format!("{}/sendDocument", self.base))
-            .multipart(form)
-            .timeout(Duration::from_secs(600))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if !resp.ok {
-            bail!(
-                "sendDocument failed: {}",
-                resp.description.unwrap_or_else(|| "unknown error".into())
-            );
-        }
-        Ok(())
+        Err(last
+            .map(anyhow::Error::new)
+            .unwrap_or_else(|| anyhow::anyhow!("sendDocument: нет сетевого маршрута")))
     }
 
     /// Ответ Claude: Markdown → HTML Telegram. Если Telegram отверг разметку
@@ -361,12 +457,12 @@ impl Bot {
     }
 
     /// Тот же ответ, но возвращает id отправленных сообщений.
-    pub async fn send_markdown_ids(&self, chat_id: i64, text: &str) -> Vec<i64> {
+    pub async fn send_markdown_ids(&self, chat_id: i64, text: &str) -> Result<Vec<i64>> {
         let text = if text.trim().is_empty() { "(пустой ответ)" } else { text };
         let mut ids = Vec::new();
         for (html, plain) in crate::markdown::to_html_chunks(text, 3000) {
-            let res: Result<Value> = self
-                .call(
+            let res = self
+                .call_send(
                     "sendMessage",
                     json!({
                         "chat_id": chat_id,
@@ -382,13 +478,18 @@ impl Bot {
                         ids.push(id);
                     }
                 }
-                Err(e) => {
+                Err(e) if e.downcast_ref::<ApiRejected>().is_some() => {
                     log::warn!("sendMessage HTML to {chat_id} rejected, sending plain: {e:#}");
-                    ids.extend(self.send_text_ids(chat_id, &plain).await);
+                    ids.extend(self.send_text_ids(chat_id, &plain).await?);
                 }
+                Err(e) if ids.is_empty() => {
+                    log::error!("sendMessage to {chat_id}: {e:#}");
+                    return Err(e);
+                }
+                Err(e) => log::error!("sendMessage to {chat_id}: часть сообщения не ушла: {e:#}"),
             }
         }
-        ids
+        Ok(ids)
     }
 }
 
@@ -449,6 +550,29 @@ mod tests {
         assert_eq!(safe_name(Some("...."), "f"), "f");
         assert_eq!(safe_name(None, "f"), "f");
         assert_eq!(safe_name(Some("a\nb"), "f").chars().count(), 3);
+    }
+
+    #[test]
+    fn network_route_falls_back_when_proxy_is_set() {
+        // с прокси обязателен запасной маршрут (напрямую), без прокси — не нужен
+        let with_proxy = super::Bot::new("t", Some("http://localhost:3128")).expect("бот");
+        assert!(with_proxy.fallback.is_some());
+        assert_eq!(with_proxy.routes().len(), 2);
+
+        let direct = super::Bot::new("t", None).expect("бот");
+        assert!(direct.fallback.is_none());
+        assert_eq!(direct.routes().len(), 1);
+    }
+
+    #[test]
+    fn rejects_are_not_retried_but_network_fails_are() {
+        let rejected: anyhow::Error =
+            super::ApiRejected("sendMessage failed: bad request".into()).into();
+        assert!(!super::retryable(&rejected));
+        assert!(format!("{rejected}").contains("bad request"));
+
+        let network = anyhow::anyhow!("error sending request for url");
+        assert!(super::retryable(&network));
     }
 
     #[test]
