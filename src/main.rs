@@ -1,3 +1,4 @@
+mod adopt;
 mod backend;
 mod claude;
 mod config;
@@ -439,6 +440,22 @@ async fn main() -> Result<()> {
     );
     log::info!("вложения из чата сохраняем в {}", app.cfg.attach_dir.display());
 
+    // Перезапуск бота не убивает смену агента (KillMode=process): отмечаем,
+    // какие сессии всё ещё ведутся процессом от прежнего запуска.
+    {
+        let table = adopt::proc_cmdlines();
+        let me = std::process::id();
+        let chats = app.chats.lock().await;
+        for (chat_id, state) in chats.iter() {
+            let backend = state.backend.unwrap_or(app.cfg.backend);
+            if let Some(session) = state.session_for(backend) {
+                if let Some(pid) = adopt::find_session_pid(&table, session, me) {
+                    log::info!("chat {chat_id}: смену ведёт процесс {pid} от прежнего запуска бота");
+                }
+            }
+        }
+    }
+
     tokio::spawn(flush_outbox(app.clone()));
     tokio::spawn(resume_scheduler(app.clone()));
 
@@ -867,6 +884,13 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
             let state = app.chat_state(chat_id).await;
             let backend = state.backend.unwrap_or(app.cfg.backend);
             let queued = app.running.lock().await.get(&chat_id).map(|r| r.queue.len());
+            // Если записи о задаче нет, сессию всё равно может вести процесс от
+            // прежнего запуска бота — проверяем это, чтобы не врать про «нет».
+            let adopted = if queued.is_none() {
+                adopted_agent_pid(app, chat_id).await
+            } else {
+                None
+            };
             let window = app
                 .batches
                 .lock()
@@ -897,7 +921,10 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
                 match queued {
                     Some(0) => "да".to_string(),
                     Some(n) => format!("да, в очереди {n}"),
-                    None => "нет".to_string(),
+                    None => match adopted {
+                        Some(pid) => format!("да, смена от прошлого запуска бота (процесс {pid})"),
+                        None => "нет".to_string(),
+                    },
                 },
                 state.resume_label.as_deref().unwrap_or("нет"),
             );
@@ -933,6 +960,36 @@ const SHIFT_PROMPT: &str = "Продолжай работу из передан�
 подведи итог — что уже сделано и что осталось, — и приступай к следующему шагу. \
 Если для продолжения нужен ответ пользователя, задай ему один короткий вопрос.";
 
+/// PID процесса агента, который ведёт сессию этого чата, но был запущен не нами
+/// (бот перезапустился, а смена осталась жива благодаря KillMode=process).
+async fn adopted_agent_pid(app: &Arc<App>, chat_id: i64) -> Option<u32> {
+    let state = app.chat_state(chat_id).await;
+    let backend = state.backend.unwrap_or(app.cfg.backend);
+    let session = state.session_for(backend).cloned()?;
+    tokio::task::spawn_blocking(move || {
+        adopt::find_session_pid(&adopt::proc_cmdlines(), &session, std::process::id())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Ждём, пока прежняя смена закончится. `cap` — предел ожидания: заснувшего
+/// процесса ждать вечно нельзя, иначе чат встанет навсегда.
+async fn wait_adopted_agent(app: &Arc<App>, chat_id: i64, cap: Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if adopted_agent_pid(app, chat_id).await.is_none() {
+            return true;
+        }
+        if started.elapsed() >= cap {
+            return false;
+        }
+        app.bot.send_typing(chat_id).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 /// Starts an agent turn on the chat's backend, or queues the prompt if one is
 /// already running for this chat. Queued messages are sent together as one
 /// turn after the current one finishes.
@@ -949,6 +1006,15 @@ async fn run_agent(app: Arc<App>, chat_id: i64, prompt: String) {
             return;
         }
         running.insert(chat_id, Running { cancel: cancel.clone(), queue: Vec::new() });
+    }
+
+    // Смена могла достаться от прежнего запуска бота: не поднимаем второй
+    // процесс поверх работающего и не теряем сообщение — сначала дожидаемся.
+    if adopted_agent_pid(&app, chat_id).await.is_some() {
+        app.status(chat_id, "Эту сессию ведёт процесс с прошлого запуска бота — жду его конца").await;
+        if !wait_adopted_agent(&app, chat_id, Duration::from_secs(900)).await {
+            log::warn!("chat {chat_id}: прежняя смена не закончилась за 15 минут, начинаем новую");
+        }
     }
 
     let mut prompt = prompt;
