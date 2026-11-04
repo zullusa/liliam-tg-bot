@@ -31,6 +31,8 @@ pub struct Update {
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
+    /// Telegram отдаёт id сообщения в поле `message_id`.
+    #[serde(rename = "message_id")]
     pub id: i64,
     pub chat: Chat,
     pub from: Option<User>,
@@ -135,12 +137,17 @@ impl Bot {
         self.call("getMe", json!({})).await
     }
 
+    /// Updates приходят «пакетом»: одно кривое обновление не должно блокировать
+    /// очередь насовсем (offset не двигается). Не декодировалось — ругаемся и
+    /// пропускаем, offset по нему всё равно уходит вперёд.
     pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
-        self.call(
-            "getUpdates",
-            json!({ "offset": offset, "timeout": 50, "allowed_updates": ["message"] }),
-        )
-        .await
+        let raw: Vec<Value> = self
+            .call(
+                "getUpdates",
+                json!({ "offset": offset, "timeout": 50, "allowed_updates": ["message"] }),
+            )
+            .await?;
+        Ok(parse_updates(raw))
     }
 
     pub async fn send_typing(&self, chat_id: i64) {
@@ -245,6 +252,23 @@ impl Bot {
         tokio::fs::write(dest, &bytes).await.context("не записать файл на диск")?;
         Ok(bytes.len() as u64)
     }
+}
+
+/// Разбор пакета обновлений: битое обновление не блокирует очередь — вместо
+/// него пустое (без сообщения), но offset по нему всё равно уходит вперёд.
+fn parse_updates(raw: Vec<Value>) -> Vec<Update> {
+    let mut out = Vec::with_capacity(raw.len());
+    for value in raw {
+        match serde_json::from_value::<Update>(value.clone()) {
+            Ok(update) => out.push(update),
+            Err(e) => {
+                let id = value.get("update_id").and_then(Value::as_i64).unwrap_or_default();
+                log::warn!("update {id} пропущен: {e}");
+                out.push(Update { update_id: id, message: None });
+            }
+        }
+    }
+    out
 }
 
 /// Имя файла для диска: Telegram может прислать что угодно («../../etc/passwd»,
@@ -386,7 +410,7 @@ fn split_message(text: &str, max: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_name, split_message, Message};
+    use super::{parse_updates, safe_name, split_message};
 
     #[test]
     fn splits_long_text() {
@@ -415,17 +439,21 @@ mod tests {
     #[test]
     fn update_message_exposes_attachments() {
         let raw = serde_json::json!({
-            "id": 42,
-            "chat": { "id": 1 },
-            "from": { "id": 2 },
-            "caption": "смоти файл",
-            "document": { "file_id": "DOC", "file_name": "apk-release.apk", "file_size": 12 },
-            "photo": [
-                { "file_id": "SMALL", "file_size": 100 },
-                { "file_id": "BIG", "file_size": 9000 }
-            ]
+            "update_id": 41,
+            "message": {
+                "message_id": 42,
+                "chat": { "id": 1 },
+                "from": { "id": 2 },
+                "caption": "смоти файл",
+                "document": { "file_id": "DOC", "file_name": "apk-release.apk", "file_size": 12 },
+                "photo": [
+                    { "file_id": "SMALL", "file_size": 100 },
+                    { "file_id": "BIG", "file_size": 9000 }
+                ]
+            }
         });
-        let msg: Message = serde_json::from_value(raw).unwrap();
+        let updates = parse_updates(vec![raw]);
+        let msg = updates[0].message.as_ref().expect("сообщение разобрано");
         assert_eq!(msg.id, 42);
         assert_eq!(msg.caption.as_deref(), Some("смоти файл"));
         let files = msg.attachments();
@@ -439,9 +467,24 @@ mod tests {
     #[test]
     fn text_only_message_has_no_attachments() {
         let raw = serde_json::json!({
-            "id": 7, "chat": { "id": 1 }, "from": { "id": 2 }, "text": "привет"
+            "update_id": 6,
+            "message": { "message_id": 7, "chat": { "id": 1 }, "from": { "id": 2 }, "text": "привет" }
         });
-        let msg: Message = serde_json::from_value(raw).unwrap();
-        assert!(msg.attachments().is_empty());
+        let updates = parse_updates(vec![raw]);
+        assert!(updates[0].message.as_ref().unwrap().attachments().is_empty());
+    }
+
+    #[test]
+    fn broken_update_is_skipped_but_offset_moves_on() {
+        // первое обновление битое (нет chat), второе — обычное
+        let bad = serde_json::json!({ "update_id": 10, "message": { "message_id": 11 } });
+        let good = serde_json::json!({
+            "update_id": 12,
+            "message": { "message_id": 13, "chat": { "id": 1 }, "text": "дальше" }
+        });
+        let updates = parse_updates(vec![bad, good]);
+        assert_eq!(updates.len(), 2);
+        assert!(updates[0].message.is_none());
+        assert_eq!(updates[1].update_id, 12);
     }
 }
