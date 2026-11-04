@@ -87,6 +87,14 @@ impl Message {
     }
 }
 
+/// Ответ метода getFile: нужен только путь к файлу на сервере Telegram,
+/// сам ответ — объект, а не строка.
+#[derive(Debug, Deserialize)]
+struct FileLocation {
+    #[serde(default)]
+    file_path: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Chat {
     pub id: i64,
@@ -229,12 +237,19 @@ impl Bot {
                 "файл больше 20 МБ — Bot API такие не отдаёт (пришли его, пожалуйста, ссылкой или частями)"
             );
         }
-        let file_path: String = self
+        // getFile отвечает объектом File: путь лежит в поле file_path (не строкой!).
+        let got: FileLocation = self
             .call("getFile", json!({ "file_id": file.file_id }))
             .await
             .context("getFile: бот не получил адрес файла")?;
+        if got.file_path.is_empty() {
+            bail!("файл на сервере Telegram закончился: пришли его ещё раз");
+        }
         // Адрес файла по документации Bot API: https://api.telegram.org/file/bot<token>/<path>.
-        let url = format!("https://api.telegram.org/file/bot{}/{}", self.token, file_path);
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.token, got.file_path
+        );
         let resp = self
             .client
             .get(&url)
@@ -434,6 +449,26 @@ mod tests {
         assert_eq!(safe_name(Some("...."), "f"), "f");
         assert_eq!(safe_name(None, "f"), "f");
         assert_eq!(safe_name(Some("a\nb"), "f").chars().count(), 3);
+    }
+
+    #[test]
+    fn get_file_answer_is_an_object_with_a_path() {
+        // getFile отвечает объектом File; раньше код ждал строку и падал с
+        // «invalid type: map, expected a string» — файлы из чата не скачивались.
+        let got: super::FileLocation = serde_json::from_value(serde_json::json!({
+            "type": "document",
+            "file_id": "ABC",
+            "file_unique_id": "xyz",
+            "file_size": 11780,
+            "file_path": "documents/file_3.xlsx",
+        }))
+        .expect("объект File разбирается");
+        assert_eq!(got.file_path, "documents/file_3.xlsx");
+
+        // просроченный file_id: объект без file_path — не паника, а понятный ответ
+        let empty: super::FileLocation =
+            serde_json::from_value(serde_json::json!({ "type": "document" })).expect("пустой объект");
+        assert!(empty.file_path.is_empty());
     }
 
     #[test]

@@ -338,13 +338,19 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let args: Vec<String> = std::env::args().collect();
+    // Версию печатаем до чтения конфига: она нужна и без настроек.
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V" | "version")) {
+        println!("claudetg {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let cfg = Config::from_env()?;
     let bot = Bot::new(&cfg.bot_token, cfg.proxy_url.as_deref())?;
 
     // `claudetg send <chat_id> < file.md` — поставить Markdown в очередь чата и
     // выйти: живой бот отправит её пачкой вместе с остальными сообщениями шага.
     // Если бот не работает, отправляем сами — сообщение не должно пропасть.
-    let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("send") {
         let chat_id: i64 = args.get(2).and_then(|s| s.parse().ok()).ok_or_else(|| {
             anyhow::anyhow!("usage: claudetg send <chat_id> < message.md")
@@ -382,6 +388,17 @@ async fn main() -> Result<()> {
         let caption = rest.get(1).map(String::as_str);
         bot.send_document(chat_id, std::path::Path::new(path), caption).await?;
         return Ok(());
+    }
+    // Неизвестная подкоманда не должна тихо поднимать второй поллинг-бот:
+    // он вступает в конфликт с сервисом и забирает сообщения у него.
+    match args.get(1).map(String::as_str) {
+        None => {}
+        Some("run") | Some("start") | Some("poll") => {}
+        Some(other) => {
+            anyhow::bail!(
+                "неизвестная подкоманда {other:?}; доступно: run (по умолчанию), send, send-file, clean"
+            );
+        }
     }
     let me = bot.get_me().await?;
     let mut ids: Vec<String> = cfg.allowed_users.iter().map(i64::to_string).collect();
