@@ -8,6 +8,9 @@ Type=simple
 EnvironmentFile=%h/.config/claudetg/claudetg.env
 ExecStart=%h/.local/bin/claudetg
 Restart=on-failure
+# Перезапуск бота не убивает начатую задачу агента: сессия claude/opencode
+# доживает до конца, а следующий бот подхватывает её по session_id из состояния.
+KillMode=process
 RestartSec=5
 
 [Install]
