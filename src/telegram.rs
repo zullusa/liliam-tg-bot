@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -167,13 +167,29 @@ impl Bot {
         out
     }
 
+    /// Вырезает токен из текста: reqwest подставляет в ошибку полный URL вида
+    /// `…/bot<токен>/метод`, а ошибки мы пишем и в журнал, и в чат — токен
+    /// светиться там не должен ни при каких обстоятельствах.
+    fn scrub(&self, text: String) -> String {
+        text.replace(&self.token, "[токен]")
+    }
+
+    /// Сетевая ошибка «как есть», но без токена: цепочка сохраняется целиком.
+    fn shown<E: std::error::Error + Send + Sync + 'static>(&self, e: E) -> anyhow::Error {
+        anyhow::anyhow!(self.scrub(format!("{:#}", anyhow::Error::new(e))))
+    }
+
     async fn call<T: DeserializeOwned>(&self, method: &str, body: Value) -> Result<T> {
         let url = format!("{}/{method}", self.base);
         let mut last: Option<reqwest::Error> = None;
         for client in self.routes() {
             match client.post(&url).json(&body).send().await {
                 Ok(resp) => {
-                    let resp: ApiResponse<T> = resp.json().await?;
+                    let resp: ApiResponse<T> = resp
+                        .json()
+                        .await
+                        .map_err(|e| self.shown(e))
+                        .with_context(|| format!("{method}: ответ не разбирается"))?;
                     return match (resp.ok, resp.result) {
                         (true, Some(r)) => Ok(r),
                         _ => Err(ApiRejected(format!(
@@ -184,14 +200,14 @@ impl Bot {
                     };
                 }
                 Err(e) if is_connect_err(&e) => {
-                    log::debug!("{method}: маршрут не дошёл, пробуем следующий: {e}");
+                    log::debug!("{method}: маршрут не дошёл, пробуем следующий");
                     last = Some(e);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(self.shown(e)),
             }
         }
         Err(last
-            .map(anyhow::Error::new)
+            .map(|e| self.shown(e))
             .unwrap_or_else(|| anyhow::anyhow!("{method}: нет сетевого маршрута")))
     }
 
@@ -309,41 +325,69 @@ impl Bot {
 
     /// Скачивает вложение из чата в `dest`. Ограничение Bot API — 20 МБ на файл;
     /// если файл больше, ругаемся внятной строкой, а не сетевой ошибкой.
+    /// Сетевой сбой повторяем до трёх раз с обоими маршрутами: файлы из чата
+    /// не должны тершаться из-за одного таймаута соединения.
     pub async fn download(&self, file: &FileRef, dest: &Path) -> Result<u64> {
         if file.file_size.unwrap_or(0) > 20 * 1024 * 1024 {
             bail!(
                 "файл больше 20 МБ — Bot API такие не отдаёт (пришли его, пожалуйста, ссылкой или частями)"
             );
         }
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 1..=3u64 {
+            match self.download_once(file, dest).await {
+                Ok(size) => return Ok(size),
+                // Telegram отказал по делу (файл протух) — повторять бессмысленно
+                Err(e) if e.downcast_ref::<ApiRejected>().is_some() => return Err(e),
+                Err(e) => {
+                    log::warn!("скачивание файла: попытка {attempt} из 3: {e:#}");
+                    last = Some(e);
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(1200 * attempt)).await;
+                    }
+                }
+            }
+        }
+        Err(last.context("не скачали файл из Telegram")?)
+    }
+
+    async fn download_once(&self, file: &FileRef, dest: &Path) -> Result<u64> {
         // getFile отвечает объектом File: путь лежит в поле file_path (не строкой!).
         let got: FileLocation = self
             .call("getFile", json!({ "file_id": file.file_id }))
             .await
             .context("getFile: бот не получил адрес файла")?;
         if got.file_path.is_empty() {
-            bail!("файл на сервере Telegram закончился: пришли его ещё раз");
+            return Err(ApiRejected(
+                "файл на сервере Telegram закончился: пришли его ещё раз".into(),
+            )
+            .into());
         }
         // Адрес файла по документации Bot API: https://api.telegram.org/file/bot<token>/<path>.
+        // Токен в URL неизбежен — но в тексты ошибок его подставляет shown().
         let url = format!(
             "https://api.telegram.org/file/bot{}/{}",
             self.token, got.file_path
         );
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(600))
-            .send()
-            .await
-            .context("не скачали файл из Telegram")?;
-        if !resp.status().is_success() {
-            bail!("скачать файл не вышло: HTTP {}", resp.status());
+        let mut last: Option<anyhow::Error> = None;
+        for client in self.routes() {
+            match client.get(&url).timeout(Duration::from_secs(600)).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let bytes = resp.bytes().await.map_err(|e| self.shown(e))?;
+                    if let Some(dir) = dest.parent() {
+                        tokio::fs::create_dir_all(dir).await.ok();
+                    }
+                    tokio::fs::write(dest, &bytes).await.context("не записать файл на диск")?;
+                    return Ok(bytes.len() as u64);
+                }
+                Ok(resp) => last = Some(anyhow!("скачать файл не вышло: HTTP {}", resp.status())),
+                Err(e) => {
+                    log::debug!("скачивание файла: маршрут не дошёл, пробуем следующий");
+                    last = Some(self.shown(e));
+                }
+            }
         }
-        let bytes = resp.bytes().await.context("обрыв загрузки файла")?;
-        if let Some(dir) = dest.parent() {
-            tokio::fs::create_dir_all(dir).await.ok();
-        }
-        tokio::fs::write(dest, &bytes).await.context("не записать файл на диск")?;
-        Ok(bytes.len() as u64)
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("скачивание файла: нет сетевого маршрута")))
     }
 }
 
@@ -428,7 +472,11 @@ impl Bot {
                 .await;
             match send {
                 Ok(resp) => {
-                    let resp: ApiResponse<Value> = resp.json().await?;
+                    let resp: ApiResponse<Value> = resp
+                        .json()
+                        .await
+                        .map_err(|e| self.shown(e))
+                        .context("sendDocument: ответ не разбирается")?;
                     if !resp.ok {
                         bail!(
                             "sendDocument failed: {}",
@@ -438,14 +486,14 @@ impl Bot {
                     return Ok(());
                 }
                 Err(e) if is_connect_err(&e) => {
-                    log::debug!("sendDocument: маршрут не дошёл, пробуем следующий: {e}");
+                    log::debug!("sendDocument: маршрут не дошёл, пробуем следующий");
                     last = Some(e);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(self.shown(e)),
             }
         }
         Err(last
-            .map(anyhow::Error::new)
+            .map(|e| self.shown(e))
             .unwrap_or_else(|| anyhow::anyhow!("sendDocument: нет сетевого маршрута")))
     }
 
@@ -553,8 +601,21 @@ mod tests {
     }
 
     #[test]
-    fn network_route_falls_back_when_proxy_is_set() {
-        // с прокси обязателен запасной маршрут (напрямую), без прокси — не нужен
+    fn error_text_never_carries_the_token() {
+        // reqwest подставляет в ошибку полный URL с токеном — в журнал и чат
+        // должна уходить вычищенная строка
+        let bot = super::Bot::new("123456:SEKRET-t0ken", None).expect("бот");
+        let net = std::io::Error::other(
+            "error sending request for url (https://api.telegram.org/bot123456:SEKRET-t0ken/getFile)",
+        );
+        let shown = format!("{:#}", bot.shown(net));
+        assert!(shown.contains("error sending request"), "цепочка сохранена: {shown}");
+        assert!(!shown.contains("SEKRET"), "токен вычищен: {shown}");
+        assert!(shown.contains("[токен]"));
+    }
+
+    #[test]
+    fn network_route_falls_back_when_proxy_is_set() {        // с прокси обязателен запасной маршрут (напрямую), без прокси — не нужен
         let with_proxy = super::Bot::new("t", Some("http://localhost:3128")).expect("бот");
         assert!(with_proxy.fallback.is_some());
         assert_eq!(with_proxy.routes().len(), 2);
