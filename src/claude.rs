@@ -46,8 +46,13 @@ pub async fn run(
         .with_context(|| format!("failed to start {}", cfg.claude_bin))?;
 
     // Prompt goes through stdin so it is never mistaken for a CLI flag.
+    // Если агент успел завершиться до чтения запроса, письмо вернёт «Broken
+    // pipe»: это не повод бросать разбор — stderr и код выхода скажут, что
+    // случилось, и человек получит внятную строку вместо тишины.
     let mut stdin = child.stdin.take().context("no stdin")?;
-    stdin.write_all(prompt.as_bytes()).await?;
+    if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+        log::debug!("chat {chat_id}: запрос не вошёл агенту в stdin ({e:#}) — читаем вывод");
+    }
     drop(stdin);
 
     let stderr = child.stderr.take().context("no stderr")?;
@@ -202,6 +207,14 @@ mod tests {
     }
 
     #[test]
+    fn custom_tools_are_named_by_their_description() {
+        let tool = json!({"name": "mcp__kb__search", "input": {"description": "ищу по базе знаний"}});
+        assert_eq!(describe_tool(&tool), "🔧 ищу по базе знаний");
+        let bare = json!({"name": "mcp__kb__search", "input": {}});
+        assert_eq!(describe_tool(&bare), "🔧 Работаю над задачей");
+    }
+
+    #[test]
     fn search_patterns_and_unknown_tools_stay_plain() {
         let grep = json!({"name": "Grep", "input": {"pattern": "fn\\s+main"}});
         assert_eq!(describe_tool(&grep), "🔍 Ищу по коду");
@@ -210,4 +223,205 @@ mod tests {
         let page = json!({"name": "WebFetch", "input": {"url": "https://docs.rs/tokio/latest"}});
         assert_eq!(describe_tool(&page), "🌐 Открываю страницу: docs.rs");
     }
+
+    // ------- Проверки разбора потока `claude -p --output-format stream-json` -------
+    #[tokio::test]
+    async fn model_flag_extra_args_and_unparsable_lines() {
+        let agent = fake_agent(
+            "cl-model",
+            &[
+                "это не json — просто строка лога агента",
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"планы"},{"type":"tool_use","name":"Bash","input":{"description":"собираю проект"}},{"type":"tool_use","name":"mcp__kb","input":{"description":"ищу по базе"}}]}}"#,
+                r#"{"type":"result","result":"готово","session_id":"s-11"}"#,
+            ],
+            0,
+            true,
+        );
+        let mut cfg = cfg_for("cl-model", &agent);
+        cfg.model = Some("strata/big-model".into());
+        cfg.extra_args = vec!["--extra-flag".into()];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx.clone(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        drop(tx);
+        assert_eq!(out.text, "готово");
+        assert_eq!(out.session_id.as_deref(), Some("s-11"));
+        let mut lines = Vec::new();
+        while let Ok(crate::backend::Event::Progress(line)) = rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(lines.iter().any(|l| l.contains("собираю проект")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("🔧 ищу по базе")), "{lines:?}");
+        // модель и хвост аргументов уходят в командную строку
+        let args = crate::testkit::agent_args(&agent);
+        assert!(args.contains(&"--model".to_string()) && args.contains(&"strata/big-model".to_string()), "{args:?}");
+        assert!(args.contains(&"--extra-flag".to_string()), "{args:?}");
+    }
+
+
+
+    use crate::testkit::{fake_agent, test_config, FakeTg};
+
+    fn cfg_for(tag: &str, agent: &std::path::Path) -> crate::config::Config {
+        let tg = FakeTg::start();
+        let mut cfg = test_config(tag, tg.base());
+        cfg.claude_bin = agent.display().to_string();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn result_line_is_the_final_answer() {
+        let agent = fake_agent(
+            "cl-run",
+            &[
+                r#"{"type":"assistant","session_id":"s-9","message":{"content":[{"type":"text","text":"думаю"}]}}"#,
+                r#"{"type":"result","result":"Готово","total_cost_usd":0.05}"#,
+            ],
+            0,
+            true,
+        );
+        let cfg = cfg_for("cl-run", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, Some("s-old"), "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert_eq!(out.text, "Готово");
+        assert_eq!(out.session_id.as_deref(), Some("s-9"));
+        assert_eq!(out.cost_usd, Some(0.05));
+        assert!(!out.is_error);
+        // продолжение прежней сессии и режим разрешений уходят в аргументы
+        let args = crate::testkit::agent_args(&agent);
+        assert!(args.contains(&"--resume".to_string()) && args.contains(&"s-old".to_string()), "{args:?}");
+        assert!(args.contains(&"auto".to_string()), "{args:?}");
+        // промпт уходит по stdin, а не флагом
+        assert_eq!(crate::testkit::agent_prompt(&agent), "дело");
+    }
+
+    #[tokio::test]
+    async fn error_result_keeps_its_text() {
+        let agent = fake_agent("cl-err", &[r#"{"type":"result","is_error":true,"result":"упало"}"#], 0, false);
+        let cfg = cfg_for("cl-err", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        assert_eq!(out.text, "упало");
+    }
+
+    #[tokio::test]
+    async fn result_without_text_explains_subtype() {
+        let agent = fake_agent("cl-sub", &[r#"{"type":"result","subtype":"error_during_execution"}"#], 0, false);
+        let cfg = cfg_for("cl-sub", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.text.contains("error_during_execution"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn silence_falls_back_to_assistant_text_or_stderr() {
+        // был текст ассистента, но нет result — показываем последний текст
+        let agent = fake_agent(
+            "cl-last",
+            &[r#"{"type":"assistant","message":{"content":[{"type":"text","text":"вот частичный ответ"}]}}"#],
+            0,
+            false,
+        );
+        let cfg = cfg_for("cl-last", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        assert_eq!(out.text, "вот частичный ответ");
+
+        // ни текста, ни result — в чат идёт stderr агента
+        let agent2 = std::env::temp_dir().join(format!("cl-stderr-{}", std::process::id()));
+        std::fs::write(
+            &agent2,
+            "#!/bin/sh\nshift 0\ncat >/dev/null\necho 'нет доступа к API' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent2, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg2 = cfg_for("cl-stderr", &agent2);
+        cfg2.claude_bin = agent2.display().to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg2, &cfg2.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        assert!(out.text.contains("нет доступа к API"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_the_agent() {
+        let agent = fake_agent("cl-cancel", &[r#"{"type":"result","result":"не успеет"}"#], 20, false);
+        let cfg = cfg_for("cl-cancel", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        cancel.notify_one();
+        let out = super::run(&cfg, &cfg.work_dir, 11, None, "дело", tx, cancel)
+            .await
+            .expect("запускается");
+        assert!(out.is_error);
+        assert!(out.text.contains("прервано"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn missing_binary_says_which_one() {
+        let tg = FakeTg::start();
+        let mut cfg = test_config("cl-nobin", tg.base());
+        cfg.claude_bin = "/nonexistent/claude-here".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("failed to start"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_agent_closed_early_is_not_fatal() {
+        // агент закрыл stdin до чтения запроса: «Broken pipe» не повод бросать
+        // разбор — stderr и код выхода дают внятную строку для чата
+        let agent = crate::testkit::fake_agent_failing("c-pipe", "claude: нет сессии", 5);
+        let cfg = cfg_for("c-pipe", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, &"д".repeat(128 * 1024), tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запрос не обязан дойти агенту");
+        assert!(out.is_error);
+        assert!(out.text.contains("нет сессии"), "{:?}", out.text);
+    }
+
 }

@@ -156,6 +156,14 @@ fn cap_tail(lines: Vec<String>, max_chars: usize) -> String {
         }
         kept.push(line);
     }
+    // самый свежий обмен не выбрасываем, даже если он один больше лимита:
+    // без него заметка бессмысленна
+    if kept.is_empty() {
+        if let Some(last) = lines.last() {
+            kept.push(last);
+            skipped = lines.len() - 1;
+        }
+    }
     kept.reverse();
     if skipped > 0 {
         let mut out = format!("…пропущено {skipped} более ранних сообщений…\n");
@@ -248,11 +256,14 @@ mod tests {
 
     /// Живая проверка на настоящем логе Claude Code: берём самую свежую сессию
     /// из ~/.claude/projects и убедимся, что расшифровка собирается.
-    #[ignore = "нужны настоящие сессии Claude Code"]
     #[test]
     fn real_session_transcripts() {
         let home = std::env::var("HOME").unwrap();
         let projects = Path::new(&home).join(".claude/projects");
+        // на машине без Claude Code проверка не нужна — просто пропускаем её
+        if !projects.is_dir() {
+            return;
+        }
         let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
         let mut stack = vec![projects];
         while let Some(dir) = stack.pop() {
@@ -281,6 +292,69 @@ mod tests {
     }
 
     #[test]
+    fn tool_lines_name_the_file_or_the_description() {
+        let lines = [
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"description": "собираю проект"}},
+                {"type": "tool_use", "name": "AskUserQuestion"},
+                {"type": "thinking", "thinking": "секретные рассуждения"},
+                {"type": "tool_use", "name": "Read", "input": {"path": "/srv/app/config.yaml"}},
+                {"type": "text", "text": "   "},
+            ]}}),
+            json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>служебный вывод"}]}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": "просто строка ответа"}}),
+            json!({"type": "queue-operation", "message": {"role": "user", "content": "не реплика"}}),
+            json!({"message": {"role": "user", "content": "нет поля type"}}),
+        ];
+        let raw = lines
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\nстрока, которая не json вообще";
+        let out = render_claude_lines(&raw).join("\n");
+        assert!(out.contains("[использовал Bash: собираю проект]"), "{out}");
+        assert!(out.contains("[использовал AskUserQuestion]"), "{out}");
+        assert!(out.contains("[использовал Read: config.yaml]"), "{out}");
+        assert!(out.contains("просто строка ответа"), "{out}");
+        assert!(!out.contains("секретные рассуждения"), "{out}");
+        assert!(!out.contains("служебный вывод"), "{out}");
+        assert!(!out.contains("не реплика"), "{out}");
+        assert!(!out.contains("нет поля type"), "{out}");
+    }
+
+    #[test]
+    fn a_session_without_replicas_gives_no_context() {
+        let dir = std::env::temp_dir().join("claudetg-handoff-empty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // файл есть, но реальных реплик в нём нет: расшифровки не будет
+        let raw = json!({"type": "system", "message": {"content": "только служебное"}}).to_string();
+        fs::write(dir.join("empty-sess.jsonl"), &raw).unwrap();
+        assert!(claude_transcript(&dir, "empty-sess", MAX_TRANSCRIPT_CHARS).is_none());
+        // битый json — тоже пустая расшифровка, а не паника
+        fs::write(dir.join("broken-sess.jsonl"), "не json\nи ещё раз\n").unwrap();
+        assert!(claude_transcript(&dir, "broken-sess", MAX_TRANSCRIPT_CHARS).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn very_deep_directories_are_not_searched() {
+        // каталоги глубже трёх уровней не разбираем: там сессий бота не бывает
+        let dir = std::env::temp_dir().join("claudetg-handoff-deep");
+        let _ = fs::remove_dir_all(&dir);
+        let deep = dir.join("a").join("b").join("c").join("d");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep-sess.jsonl"), "{}").unwrap();
+        assert!(claude_transcript(&dir, "deep-sess", MAX_TRANSCRIPT_CHARS).is_none());
+        // а на нормальной глубине файл находится
+        fs::create_dir_all(dir.join("proj")).unwrap();
+        fs::write(dir.join("proj").join("near-sess.jsonl"), "{}").unwrap();
+        assert!(find_session_file(&dir, "near-sess").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tail_is_capped_and_head_collapsed() {
         let lines: Vec<String> = (0..100).map(|i| format!("строка {i} — много текста для веса")).collect();
         let capped = cap_tail(lines, 600);
@@ -304,4 +378,70 @@ mod tests {
         assert!(note.contains("Пользователь: поправь"));
         assert!(!note.contains("Пользователь: собрал") && !note.contains("Пользователь: собери"));
     }
+
+    #[test]
+    fn transcript_is_found_in_nested_project_dirs() {
+        let dir = std::env::temp_dir().join(format!("claudetg-handoff-nested-{}", std::process::id()));
+        let deep = dir.join("proj").join("sub");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            deep.join("sess-1.jsonl"),
+            r#"{"type":"user","message":{"content":"сделай X"}}"#,
+        )
+        .unwrap();
+        let got = claude_transcript(&dir, "sess-1", 4000).expect("нашли расшифровку");
+        assert!(got.contains("сделай X"), "{got}");
+        // нет файла — молча возвращаем None, бот возьмёт заметки из памяти
+        assert!(claude_transcript(&dir, "sess-missing", 4000).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cap_tail_keeps_the_latest_lines() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("строка {i}")).collect();
+        let capped = cap_tail(lines, 40);
+        assert!(capped.contains("строка 10"), "{capped}");
+        assert!(!capped.contains("строка 8"), "{capped}");
+        assert!(capped.contains("пропущено"), "{capped}");
+        // свежий обмен остаётся, даже если он один не влезает в лимит
+        let big = vec!["д".repeat(50)];
+        assert!(cap_tail(big, 5).contains('д'));
+        // пустота — пустая строка
+        assert_eq!(cap_tail(Vec::new(), 100), "");
+    }
+
+    #[test]
+    fn directory_walk_stops_after_a_few_levels() {
+        let root = std::env::temp_dir().join(format!("claudetg-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // четыре ветки: обход обрывается на пределе глубины, а не идёт до бесконечности
+        for branch in ["a", "b", "c", "d"] {
+            fs::create_dir_all(root.join(branch)).unwrap();
+        }
+        fs::write(root.join("a").join("nope.jsonl"), "{}").unwrap();
+        assert!(find_session_file(&root, "session").is_none());
+        // а на малой глубине файл находится
+        fs::write(root.join("session.jsonl"), "{}").unwrap();
+        assert_eq!(find_session_file(&root, "session"), Some(root.join("session.jsonl")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn odd_content_shapes_are_skipped() {
+        let raw = [
+            // текст без поля text — брать нечего
+            json!({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text"}, {"type": "text", "text": "   "}]}}),
+            // content не строка и не список — пропускаем
+            json!({"type": "assistant", "message": {"role": "assistant", "content": 42}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": null}}),
+            // обычная строка дальше работает как прежде
+            json!({"type": "assistant", "message": {"role": "assistant", "content": "обычный ответ"}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        let lines = render_claude_lines(&raw);
+        assert_eq!(lines, vec!["Ассистент: обычный ответ".to_string()], "{lines:?}");
+    }
+
 }

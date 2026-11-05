@@ -54,6 +54,7 @@ pub enum Event {
     Progress(String),
 }
 
+#[derive(Debug)]
 pub struct Outcome {
     pub session_id: Option<String>,
     pub text: String,
@@ -122,6 +123,16 @@ pub fn with_detail(icon: &str, text: &str, detail: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_names_print_short() {
+        // печать агенту в чате и в логе: имя совпадает с тем, что человек пишет в /backend
+        assert_eq!(Backend::Claude.to_string(), "claude");
+        assert_eq!(format!("{}", Backend::OpenCode), "opencode");
+        assert_eq!(Backend::OpenCode.name(), "opencode");
+        // отладочная печать перечисления — как в коде
+        assert_eq!(format!("{:?}", Backend::Claude), "Claude");
+    }
+
     use super::Backend;
     use std::str::FromStr;
 
@@ -131,5 +142,33 @@ mod tests {
         assert_eq!(Backend::from_str(" claude ").unwrap(), Backend::Claude);
         assert!(Backend::from_str("gpt").is_err());
         assert_eq!(Backend::OpenCode.name(), "opencode");
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_for_missing_binary_is_an_error() {
+        // оба бэкенда идут через один слой: отсутствие бинарника — ошибка, не паника
+        use crate::backend::{run, Backend};
+        use crate::testkit::{test_config, FakeTg};
+        let tg = FakeTg::start();
+        let mut cfg = test_config("backend-miss", tg.base());
+        cfg.claude_bin = "/nonexistent/claude-x".into();
+        cfg.opencode_bin = "/nonexistent/opencode-x".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        for backend in [Backend::Claude, Backend::OpenCode] {
+            let err = run(backend, &cfg, &cfg.work_dir, 1, None, "дело", tx.clone(), cancel.clone())
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("failed to start"), "{backend}: {err}");
+        }
+    }
+
+    #[test]
+    fn helper_text_helpers() {
+        use crate::backend::{file_name, with_detail};
+        assert_eq!(file_name("/a/b/c.rs"), "c.rs");
+        assert_eq!(file_name("просто строка"), "просто строка");
+        assert_eq!(with_detail("📖", "Читаю файл", "x.rs".into()), "📖 Читаю файл: x.rs");
+        assert_eq!(with_detail("📖", "Читаю файл", String::new()), "📖 Читаю файл");
     }
 }

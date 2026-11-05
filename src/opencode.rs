@@ -51,9 +51,13 @@ pub async fn run(
         .with_context(|| format!("failed to start {}", cfg.opencode_bin))?;
 
     // Prompt goes through stdin so it is never mistaken for a CLI flag.
+    // «Broken pipe» здесь тоже не ошибка: агент мог завершиться, не прочитав
+    // запрос, — причины видны из stderr и кода выхода.
     let mut stdin = child.stdin.take().context("no stdin")?;
     let full_prompt = format!("{SYSTEM_PROMPT}\n\n---\n{prompt}");
-    stdin.write_all(full_prompt.as_bytes()).await?;
+    if let Err(e) = stdin.write_all(full_prompt.as_bytes()).await {
+        log::debug!("chat {chat_id}: запрос не вошёл агенту в stdin ({e:#}) — читаем вывод");
+    }
     drop(stdin);
 
     let stderr = child.stderr.take().context("no stderr")?;
@@ -242,61 +246,39 @@ mod tests {
     /// Живая проверка формата `opencode run --format json`: запуск настоящего
     /// opencode, два хода в одной сессии, продолжение по sessionID.
     /// `cargo test -- --ignored` — нужен установленный opencode с настроенным провайдером.
+    #[test]
+    fn helper_tools_and_unknown_tools_are_named_by_description() {
+        let task = json!({"tool": "task", "state": {"input": {"description": "переписать модуль"}}});
+        assert_eq!(describe_tool(task), "🤖 Поручаю часть работы помощнику: переписать модуль");
+        let other = json!({"tool": "mcp_db", "state": {"input": {"description": "читаю таблицу"}}});
+        assert_eq!(describe_tool(other), "🔧 читаю таблицу");
+    }
+
+    /// Живая проверка формата `opencode run --format json`: настоящая сессия
+    /// должна продолжаться по `--session`, а не начинаться заново.
     #[ignore = "нужен установленный opencode и настроенный провайдер"]
     #[tokio::test]
     async fn live_turn_resumes_session() {
         use super::run;
-        use crate::backend::{Backend, Event};
-        use crate::config::Config;
-        use std::sync::Arc;
+        use crate::backend::Event;
         use tokio::sync::{mpsc, Notify};
 
-        let cfg = Config {
-            bot_token: String::new(),
-            allowed_users: Default::default(),
-            proxy_url: None,
-            backend: Backend::OpenCode,
-            claude_bin: "claude".into(),
-            work_dir: std::env::temp_dir(),
-            permission_mode: "auto".into(),
-            model: None,
-            extra_args: Vec::new(),
-            opencode_bin: "opencode".into(),
-            opencode_model: Some("strata/qwen3.8-flash-next-iq3_s".into()),
-            opencode_agent: None,
-            opencode_auto: true,
-            opencode_extra_args: Vec::new(),
-            status_bubble: true,
-            state_file: "/dev/null".into(),
-            outbox_dir: "/tmp/claudetg-outbox-test".into(),
-            sent_log: "/tmp/claudetg-sent-test.jsonl".into(),
-            pid_file: "/tmp/claudetg-pid-test".into(),
-            send_quiet_secs: 7,
-            send_max_secs: 25,
-            send_max_items: 4,
-            drop_chatter: true,
-            attach_dir: "/tmp/claudetg-attach-test".into(),
-            attach_max_mb: 20,
-            limit_fallback: false,
-            claude_projects_dir: "/nonexistent".into(),
-            agg_quiet_secs: 0,
-            agg_window_secs: 0,
-        };
-        let dir = cfg.work_dir.join("claudetg-smoke");
-        std::fs::create_dir_all(&dir).unwrap();
+        // настройки как в тестах на подставе, только агент настоящий
+        let tg = FakeTg::start();
+        let mut cfg = test_config("live-opencode", tg.base());
+        cfg.opencode_bin = "opencode".into();
+        cfg.work_dir = std::env::temp_dir().join("claudetg-live-opencode");
+        std::fs::create_dir_all(&cfg.work_dir).unwrap();
+        let dir = cfg.work_dir.clone();
 
         let (tx, _rx) = mpsc::unbounded_channel::<Event>();
         let first = run(
-            &cfg,
-            &dir,
-            0,
-            None,
+            &cfg, &dir, 0, None,
             "Запомни кодовое слово «ОРАНЖЕВОЕ». Ответь ровно: ОК",
-            tx,
-            Arc::new(Notify::new()),
+            tx, std::sync::Arc::new(Notify::new()),
         )
         .await
-        .unwrap();
+        .expect("первый ход");
         assert!(!first.is_error, "первый ход: {}", first.text);
         assert!(first.text.contains("ОК"), "первый ход: {}", first.text);
         let session = first.session_id.expect("sessionID в потоке json");
@@ -304,16 +286,12 @@ mod tests {
 
         let (tx2, _rx2) = mpsc::unbounded_channel::<Event>();
         let second = run(
-            &cfg,
-            &dir,
-            0,
-            Some(&session),
+            &cfg, &dir, 0, Some(&session),
             "Какое кодовое слово я просил запомнить? Ответь одним словом.",
-            tx2,
-            Arc::new(Notify::new()),
+            tx2, std::sync::Arc::new(Notify::new()),
         )
         .await
-        .unwrap();
+        .expect("второй ход");
         assert!(!second.is_error, "второй ход: {}", second.text);
         assert!(
             second.text.to_uppercase().contains("ОРАНЖЕВОЕ") || second.text.contains("Оранжево"),
@@ -321,4 +299,240 @@ mod tests {
             second.text
         );
     }
+
+    // ------- Проверки разбора потока `opencode run --format json` -------
+
+    use crate::testkit::{fake_agent, test_config, FakeTg};
+
+    fn cfg_for(tag: &str, agent: &std::path::Path) -> crate::config::Config {
+        let tg = FakeTg::start();
+        let mut cfg = test_config(tag, tg.base());
+        cfg.opencode_bin = agent.display().to_string();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn text_events_give_answer_session_and_cost() {
+        let agent = fake_agent(
+            "oc-run",
+            &[
+                r#"{"type":"text","sessionID":"oc-1","part":{"text":"Итог: готово"}}"#,
+                r#"{"type":"step_finish","part":{"cost":0.02}}"#,
+            ],
+            0,
+            true,
+        );
+        let cfg = cfg_for("oc-run", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg,
+            &cfg.work_dir,
+            11,
+            None,
+            "дело",
+            tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert_eq!(out.text, "Итог: готово");
+        assert_eq!(out.session_id.as_deref(), Some("oc-1"));
+        assert_eq!(out.cost_usd, Some(0.02));
+        assert!(!out.is_error);
+        let args = crate::testkit::agent_args(&agent);
+        assert!(args.contains(&"--auto".to_string()), "авто-режим включён: {args:?}");
+        assert!(args.contains(&"--session".to_string()) || !args.iter().any(|a| a == "--session"));
+    }
+
+    #[tokio::test]
+    async fn tool_events_become_progress_lines() {
+        let agent = fake_agent(
+            "oc-tool",
+            &[
+                r#"{"type":"tool_use","part":{"tool":"read","state":{"status":"completed","input":{"filePath":"/tmp/отчёт.md"}}}}"#,
+                r#"{"type":"text","part":{"text":"прочитал"}}"#,
+            ],
+            0,
+            false,
+        );
+        let cfg = cfg_for("oc-tool", &agent);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, Some("oc-7"), "дело", tx.clone(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        drop(tx);
+        let ev = rx.recv().await.expect("событие прогресса");
+        match ev {
+            crate::backend::Event::Progress(line) => assert!(line.contains("отчёт.md"), "{line}"),
+        }
+        assert_eq!(out.text, "прочитал");
+        // продолжение сессии попадает в командную строку через --session
+        assert_eq!(out.session_id.as_deref(), Some("oc-7"));
+    }
+
+    #[tokio::test]
+    async fn error_event_wins_over_partial_text() {
+        let agent = fake_agent(
+            "oc-err",
+            &[
+                r#"{"type":"text","part":{"text":"начал"}}"#,
+                r#"{"type":"error","error":{"type":"error","message":"Provider limit reached"}}"#,
+            ],
+            0,
+            false,
+        );
+        let cfg = cfg_for("oc-err", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        // сообщение про лимит важнее частичного ответа: по нему планируют продолжение
+        assert!(out.text.contains("limit"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_reports_interrupt() {
+        let agent = fake_agent("oc-cancel", &[r#"{"type":"text","part":{"text":"не успеет"}}"#], 20, false);
+        let cfg = cfg_for("oc-cancel", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        cancel.notify_one();
+        let out = super::run(&cfg, &cfg.work_dir, 11, None, "дело", tx, cancel)
+            .await
+            .expect("запускается");
+        assert!(out.is_error);
+        assert!(out.text.contains("прервано"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn missing_binary_is_an_error_not_a_panic() {
+        let tg = FakeTg::start();
+        let mut cfg = test_config("oc-nobin", tg.base());
+        cfg.opencode_bin = "/nonexistent/opencode-here".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("failed to start"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn model_and_agent_flags_survive_noisy_output() {
+        let agent = fake_agent(
+            "oc-flags",
+            &[
+                "обычная строка лога, не json",
+                r#"{"type":"step_start","part":{"type":"text"}}"#,
+                r#"{"type":"tool_use","part":{"tool":"task","state":{"input":{"description":"поручаю подреву"}}}}"#,
+                r#"{"type":"text","sessionID":"oc-9","part":{"text":"готово"}}"#,
+                r#"{"type":"step_finish","part":{"cost":0.01}}"#,
+            ],
+            0,
+            true,
+        );
+        let mut cfg = cfg_for("oc-flags", &agent);
+        cfg.opencode_model = Some("strata/small-model".into());
+        cfg.opencode_agent = Some("reviewer".into());
+        cfg.opencode_extra_args = vec!["--thinking".into()];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx.clone(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        drop(tx);
+        assert_eq!(out.text, "готово");
+        assert_eq!(out.session_id.as_deref(), Some("oc-9"));
+        assert_eq!(out.cost_usd, Some(0.01));
+        match rx.recv().await.expect("строка о инструменте") {
+            crate::backend::Event::Progress(line) => assert!(line.contains("подреву"), "{line}"),
+        }
+        let args = crate::testkit::agent_args(&agent);
+        assert!(args.contains(&"-m".to_string()) && args.contains(&"strata/small-model".to_string()), "{args:?}");
+        assert!(args.contains(&"--agent".to_string()) && args.contains(&"reviewer".to_string()), "{args:?}");
+        assert!(args.contains(&"--thinking".to_string()), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_process_reports_its_stderr() {
+        let agent = crate::testkit::fake_agent_failing("oc-fail", "opencode: нет доступа к сессии", 3);
+        let cfg = cfg_for("oc-fail", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        assert!(out.text.contains("нет доступа к сессии"), "{:?}", out.text);
+    }
+
+    #[tokio::test]
+    async fn silent_exit_is_reported_as_failure() {
+        // агент вышел молча: пустой ответ — это ошибка, а не «пустое сообщение» в чат
+        let agent = fake_agent("oc-silent", &[], 0, false);
+        let cfg = cfg_for("oc-silent", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        assert!(out.text.contains("без ответа"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn an_error_that_is_not_a_limit_keeps_the_answer_so_far() {
+        let agent = fake_agent(
+            "oc-errtext",
+            &[
+                r#"{"type":"text","sessionID":"oc-8","part":{"text":"Половину работы сделал"}}"#,
+                r#"{"type":"error","error":{"type":"provider_error","message":"модель недоступна"}}"#,
+            ],
+            0,
+            false,
+        );
+        let cfg = cfg_for("oc-errtext", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error, "ошибка есть");
+        assert_eq!(out.text, "Половину работы сделал", "не лимит — показываем сделанное");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_agent_closed_early_is_not_fatal() {
+        // агент закрыл stdin, не прочитав запрос: письмо вернёт «Broken pipe»,
+        // а причины видны из stderr и кода выхода
+        let agent = crate::testkit::fake_agent_failing("oc-pipe", "запрос не дошёл", 4);
+        let cfg = cfg_for("oc-pipe", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, &"д".repeat(128 * 1024), tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запрос не обязан дойти агенту");
+        assert!(out.is_error);
+        assert!(out.text.contains("запрос не дошёл"), "{:?}", out.text);
+    }
+
 }

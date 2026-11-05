@@ -139,6 +139,36 @@ mod tests {
     }
 
     #[test]
+    fn dated_reset_of_the_past_year_rolls_over() {
+        // «Nov 3» уже прошло в этом году — ждём сброса в следующем
+        let now = utc("2026-12-20T08:00:00Z");
+        let (at, label) = resume_at(
+            "You've hit your weekly limit · resets Nov 3, 9am (Europe/Moscow)",
+            now,
+        )
+        .expect("недельный лимит");
+        assert!(at > utc("2027-11-03T00:00:00Z") && at < utc("2027-11-04T00:00:00Z"), "{at}");
+        assert!(label.contains("2027") || label.contains("03.11"), "{label}");
+    }
+
+    #[test]
+    fn times_are_read_in_twelve_hour_clock() {
+        assert_eq!(parse_time("12:05pm"), NaiveTime::from_hms_opt(12, 5, 0));
+        assert_eq!(parse_time("1pm"), NaiveTime::from_hms_opt(13, 0, 0));
+        assert_eq!(parse_time("12am"), NaiveTime::from_hms_opt(0, 0, 0));
+        assert_eq!(parse_time("11:40am"), NaiveTime::from_hms_opt(11, 40, 0));
+        // время без am/pm не разбираем — иначе нельзя понять, когда продолжать
+        assert_eq!(parse_time("10:40"), None);
+        assert_eq!(parse_time("0am"), None, "часа 0 в двенадцатичасовом формате нет");
+    }
+
+    #[test]
+    fn a_reset_without_am_or_pm_is_not_a_schedule() {
+        let now = utc("2026-11-05T08:00:00Z");
+        assert!(resume_at("limit reached · resets 10:40 (Europe/Moscow)", now).is_none());
+    }
+
+    #[test]
     fn ordinary_text_and_garbage_are_ignored() {
         let now = utc("2026-11-01T07:00:00Z");
         assert!(resume_at("Готово: всё выложено", now).is_none());

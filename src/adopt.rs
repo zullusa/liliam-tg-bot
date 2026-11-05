@@ -115,4 +115,14 @@ mod tests {
         }
         assert!(table.iter().any(|(pid, _)| *pid == me));
     }
+
+    #[test]
+    fn equal_form_is_compared_exactly() {
+        let table = vec![(9, args("claude -p --session=ses-one --resume=ses-two"))];
+        // вторая пара совпала, первая — мимо: сравнение посимвольное
+        assert_eq!(find_session_pid(&table, "ses-two", 1), Some(9));
+        assert_eq!(find_session_pid(&table, "ses", 1), None, "часть имени не совпадение");
+        assert_eq!(find_session_pid(&table, "ses-three", 1), None);
+    }
+
 }

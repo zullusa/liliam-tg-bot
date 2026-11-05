@@ -14,27 +14,51 @@ pub fn to_html_chunks(md: &str, max_chars: usize) -> Vec<(String, String)> {
 }
 
 fn split_markdown(md: &str, max: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
+    let max = max.max(1);
+    let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut len = 0;
+    let mut len = 0usize;
     let mut fence: Option<String> = None; // открывающая строка текущего блока кода
     for line in md.split_inclusive('\n') {
         let line_len = line.chars().count();
+        // граница между кусками: закрываем блок кода и открываем его заново
+        // в следующем куске, чтобы Telegram не увидел незакрытый ```
         if len + line_len > max && !current.is_empty() {
-            if fence.is_some() {
+            if let Some(open) = fence.clone() {
                 current.push_str("```\n");
+                chunks.push(std::mem::take(&mut current));
+                current.push_str(&open);
+                len = open.chars().count();
+                if line_len > max {
+                    // длинная строка внутри блока: её тоже режем ровно по max
+                    for c in line.chars() {
+                        if len == max {
+                            current.push_str("```\n");
+                            chunks.push(std::mem::take(&mut current));
+                            current.push_str(&open);
+                            len = open.chars().count();
+                        }
+                        current.push(c);
+                        len += 1;
+                    }
+                } else {
+                    current.push_str(line);
+                    len += line_len;
+                }
+                if line.trim_start().starts_with("```") {
+                    // сюда попадаем только с уже открытым блоком (см. `if let
+                    // Some(open) = fence.clone()` выше), значит строка ``` его закрывает
+                    fence = None;
+                }
+                continue;
             }
             chunks.push(std::mem::take(&mut current));
             len = 0;
-            if let Some(open) = &fence {
-                current.push_str(open);
-                len = open.chars().count();
-            }
         }
         // Одна строка длиннее предела — режется по символам.
         if line_len > max {
             for c in line.chars() {
-                if len >= max {
+                if len == max {
                     chunks.push(std::mem::take(&mut current));
                     len = 0;
                 }
@@ -304,4 +328,128 @@ mod tests {
             assert_eq!(chunk.matches("```").count() % 2, 0, "блок кода не закрыт: {chunk}");
         }
     }
+
+    #[test]
+    fn html_specials_are_escaped() {
+        let out = to_html("a <b> & c > d");
+        assert!(out.contains("&lt;b&gt;") && out.contains("&amp;"), "{out}");
+    }
+
+    #[test]
+    fn lists_headers_and_tables_become_plain_lines() {
+        let out = to_html("# Заголовок\n- пункт один\n* пункт два\n\n| а | б |\n|---|---|\n| 1 | 2 |");
+        assert!(out.contains("<b>Заголовок</b>"), "{out}");
+        assert!(out.contains("•") && out.contains("пункт один"), "{out}");
+        // таблица: не ломается, строки остаются читаемыми
+        assert!(out.contains("а") && out.contains("2"), "{out}");
+    }
+
+    #[test]
+    fn inline_marks_map_to_html() {
+        let out = to_html("**жирный** и *курсив* и `код`");
+        assert!(out.contains("<b>жирный</b>"), "{out}");
+        assert!(out.contains("<i>курсив</i>"), "{out}");
+        assert!(out.contains("<code>код</code>"), "{out}");
+    }
+
+    #[test]
+    fn links_survive_as_anchors() {
+        let out = to_html("см. [документацию](https://example.com/docs)");
+        assert!(out.contains("<a href=\"https://example.com/docs\">документацию</a>"), "{out}");
+    }
+
+    #[test]
+    fn one_long_line_is_cut_to_size_and_keeps_the_fence() {
+        // строка длиннее предела режется по символам, а не вылезает за лимит
+        let md = format!("```rust\nlet s = \"{}\";\n```", "x".repeat(40));
+        let chunks = to_html_chunks(&md, 14);
+        assert!(chunks.len() > 2, "{chunks:?}");
+        for (html, src) in &chunks {
+            assert!(src.chars().count() <= 14 + 8, "кусок длиннее предела: {src:?}");
+            let _ = html;
+        }
+        let joined: String = chunks.iter().map(|(_, s)| s.clone()).collect::<String>();
+        assert!(joined.contains("xxxxx"), "содержимое сохранено");
+    }
+
+    #[test]
+    fn quotes_and_nested_marks_survive() {
+        let out = to_html("> важная цитата с **акцентом**\n> продолжение");
+        assert!(out.contains("важная цитата"), "{out}");
+        assert!(out.contains("акцентом"), "{out}");
+        // одиночная звёздочка внутри слова не превращается в курсив
+        let plain = to_html("a_b_c без разметки");
+        assert!(plain.contains("a_b_c"), "{plain}");
+    }
+
+    #[test]
+    fn a_long_line_without_a_fence_is_cut_by_characters() {
+        // строка длиннее предела режется по символам и без блока кода
+        let md = format!("первая строка\n{}\nзаключительная", "д".repeat(100));
+        let chunks = split_markdown(&md, 20);
+        assert!(chunks.len() >= 6, "{chunks:?}");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 21, "кусок длиннее предела: {chunk:?}");
+        }
+        let joined: String = chunks.concat();
+        assert_eq!(joined.matches('д').count(), 100, "ни один символ не потерян");
+        assert!(joined.starts_with("первая строка"), "{joined:?}");
+    }
+
+    #[test]
+    fn a_fence_opened_on_the_boundary_is_reopened_in_the_next_chunk() {
+        let md = "первая строка\nвторая строка\n```rust\nlet a = 1;\n```\nпосле блока\n";
+        // предел такой, что граница приходится ровно на открывающую строку блока
+        let chunks = split_markdown(md, 30);
+        assert!(chunks.len() >= 3, "{chunks:?}");
+        for (i, chunk) in chunks.iter().enumerate() {
+            let fences = chunk.lines().filter(|l| l.trim_start().starts_with("```")).count();
+            assert!(fences % 2 == 0, "кусок {i} с незакрытым блоком кода: {chunk:?}");
+        }
+        let joined: String = chunks.concat();
+        assert!(joined.contains("let a = 1;"), "{joined:?}");
+    }
+
+    #[test]
+    fn code_without_language_and_table_followed_by_text() {
+        let md = "```\nключ <tag> & значение\n```\n| колонка | ещё |\n| --- | --- |\nобычный текст после таблицы\n";
+        let html = to_html(md);
+        assert!(html.contains("<pre>ключ &lt;tag&gt; &amp; значение</pre>"), "{html}");
+        assert!(!html.contains("language-"), "языка не было — класса не добавляем: {html}");
+        assert!(html.contains("колонка"), "{html}");
+        assert!(html.contains("обычный текст после таблицы"), "{html}");
+    }
+
+    #[test]
+    fn half_broken_markup_stays_text() {
+        // ссылка не http, пустые пары маркеров и курсив с пробелом перед закрытием
+        let html = to_html("[текст](ftp://example) и **** и *курсив * и ещё _внутри_слова_");
+        assert!(!html.contains("<a href"), "{html}");
+        assert!(!html.contains("<b></b>"), "{html}");
+        assert!(!html.contains("<i>курсив </i>"), "{html}");
+        assert!(html.contains("ftp://example"), "{html}");
+    }
+
+    #[test]
+    fn long_code_fence_reopens_after_split() {
+        let md = "до\n```rust\nlet a = 1;\n```\nпосле";
+        let chunks = to_html_chunks(md, 10);
+        assert!(chunks.len() > 1, "должно разрезать: {chunks:?}");
+        for (html, src) in &chunks {
+            assert_eq!(src.matches("```").count() % 2, 0, "кусок с незакрытым блоком: {src}");
+            let _ = html;
+        }
+    }
+
+    #[test]
+    fn char_search_stops_at_the_edges() {
+        use super::find;
+        let chars: Vec<char> = "слово".chars().collect();
+        assert_eq!(find(&chars, 1, "ло"), Some(1));
+        // пустая подстрока и поиск за концом — ничего не ищем
+        assert!(find(&chars, 0, "").is_none());
+        assert!(find(&chars, 9, "о").is_none());
+        assert!(find(&[], 0, "о").is_none());
+    }
+
 }

@@ -30,11 +30,33 @@ pub struct Item {
     pub chat: i64,
     pub kind: Kind,
     pub text: String,
+    /// Приложенный файл (APK, выгрузка): очередь умеет и в них, чтобы отдача файла
+    /// подчинялась тем же правилам — паузе Telegram, сроку годности, журналу
+    /// отправленного. Поля нет у записей, поставленных прежней версией бота,
+    /// оттого `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 impl Item {
     pub fn new(chat: i64, kind: Kind, text: impl Into<String>) -> Self {
-        Self { ts: now_ms(), chat, kind, text: text.into() }
+        Self { ts: now_ms(), chat, kind, text: text.into(), path: None }
+    }
+
+    /// Файл документом с подписью: текст записи — эта самая подпись.
+    pub fn file(chat: i64, kind: Kind, path: impl Into<PathBuf>, caption: impl Into<String>) -> Self {
+        Self {
+            ts: now_ms(),
+            chat,
+            kind,
+            text: caption.into(),
+            path: Some(path.into()),
+        }
+    }
+
+    /// Это запись про файл, а не про текст?
+    pub fn is_file(&self) -> bool {
+        self.path.is_some()
     }
 }
 
@@ -110,6 +132,39 @@ pub fn due_chats(items: &[(PathBuf, Item)], now: i64, policy: &Policy) -> Vec<i6
                 || mine.len() >= policy.max_items
         })
         .collect()
+}
+
+/// Устаревшие сообщения: протухшие за время простоя (Telegram ограничил частоту,
+/// связи не было). Отправлять их через час после смысла уже нет — человек
+/// получает «старые ответы», которые он видел в живой переписке. Такие снимаем
+/// с очереди и пишем в журнал, сколько и почему убрали. `ttl_ms <= 0` — срок
+/// отключён, очередь ждёт сколько угодно.
+pub fn stale_paths(items: &[(PathBuf, Item)], now: i64, ttl_ms: i64) -> Vec<PathBuf> {
+    if ttl_ms <= 0 {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .filter(|(_, it)| now - it.ts > ttl_ms)
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
+/// Память о последних отправленных текстах — из журнала отправленного.
+/// Без неё перезапуск бота теряет защиту от повторов, и очередь, стоявшая
+/// во время лимита, уходит в чат повторно.
+pub fn seed_recent(records: &[SentRecord], keep: usize) -> std::collections::HashMap<i64, Vec<String>> {
+    let mut out: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for r in records {
+        out.entry(r.chat).or_default().push(r.preview.clone());
+    }
+    for texts in out.values_mut() {
+        if texts.len() > keep {
+            let extra = texts.len() - keep;
+            texts.drain(0..extra);
+        }
+    }
+    out
 }
 
 /// Сохраняя порядок, склеиваем сообщения чата в одно. Разделитель — отдельная
@@ -288,7 +343,7 @@ mod tests {
     use super::*;
 
     fn item(chat: i64, ts: i64, kind: Kind, text: &str) -> Item {
-        Item { ts, chat, kind, text: text.into() }
+        Item { ts, chat, kind, text: text.into(), path: None }
     }
 
     #[test]
@@ -336,6 +391,42 @@ mod tests {
             (PathBuf::from("b"), item(7, 9_000, Kind::Agent, "чат 7")),
         ];
         assert_eq!(due_chats(&two, 10_000, &policy), vec![1]);
+    }
+
+    #[test]
+    fn stale_items_leave_the_queue() {
+        let dir = std::env::temp_dir().join(format!("claudetg-stale-{}", now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // час назад — протухло, две минуты назад — ещё нужно
+        enqueue(&dir, &item(1, 0, Kind::Answer, "очень старый ответ")).unwrap();
+        enqueue(&dir, &item(1, 58 * 60_000, Kind::Agent, "свежий")).unwrap();
+        let all = pending(&dir);
+        let stale = stale_paths(&all, 60 * 60_000, 30 * 60_000);
+        assert_eq!(stale.len(), 1);
+        discard(&stale);
+        assert_eq!(pending(&dir).len(), 1);
+        // ttl=0 — срок отключён, не протухает ничего
+        assert!(stale_paths(&pending(&dir), i64::MAX, 0).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_remembers_recent_sends() {
+        let records = (1..=10)
+            .map(|i| SentRecord {
+                chat: if i % 2 == 0 { 7 } else { 1 },
+                message_id: i,
+                ts: i as i64,
+                kind: Kind::Answer,
+                preview: format!("ответ {i}"),
+            })
+            .collect::<Vec<_>>();
+        let recent = seed_recent(&records, 3);
+        // чаты разделены, хранятся только последние три по каждому
+        assert_eq!(recent[&1], vec!["ответ 5", "ответ 7", "ответ 9"]);
+        assert_eq!(recent[&7], vec!["ответ 6", "ответ 8", "ответ 10"]);
+        // пустой журнал — пустая память, а не паника
+        assert!(seed_recent(&[], 3).is_empty());
     }
 
     #[test]
@@ -416,4 +507,58 @@ mod tests {
         assert!(!bot_alive(&path));
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn a_queue_record_survives_without_a_file_path() {
+        // запись без пути: прежняя версия бота файлы в очередь не ставила
+        let plain: Item =
+            serde_json::from_str(r#"{"ts":1,"chat":7,"kind":"agent","text":"подпись"}"#)
+                .expect("старый формат читается");
+        assert!(!plain.is_file());
+        // запись с путём: файл и есть файл, подпись живёт в тексте
+        let with = Item::file(7, Kind::Agent, "/tmp/apk/release.apk", "готовый выпуск");
+        let raw = serde_json::to_string(&with).unwrap();
+        assert!(raw.contains("\"path\""), "{raw}");
+        let back: Item = serde_json::from_str(&raw).unwrap();
+        assert!(back.is_file());
+        assert_eq!(back.path.unwrap().to_str().unwrap(), "/tmp/apk/release.apk");
+        assert_eq!(back.text, "готовый выпуск");
+    }
+
+    #[test]
+    fn junk_in_the_queue_directory_is_not_a_message() {
+        let dir = std::env::temp_dir().join(format!("claudetg-outbox-junk-{}", now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // осколок временной записи и битый json: очередь их просто не замечает
+        std::fs::write(dir.join("stray.txt"), "не очередь").unwrap();
+        std::fs::write(dir.join("broken.json"), "{ не json").unwrap();
+        enqueue(&dir, &item(1, 100, Kind::Answer, "дело")).unwrap();
+        let got = pending(&dir);
+        assert_eq!(got.len(), 1, "читается только разобранная очередь: {got:?}");
+        assert_eq!(got[0].1.text, "дело");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blank_texts_are_never_a_sign_of_a_repeat() {
+        // пустая после нормализки строка в памяти не должна совпадать ни с чем,
+        // иначе новая фраза ошибочно считается уже отправленной
+        assert!(!is_repeat("дело сделано", &["   ".into(), "···".into()]));
+        assert!(is_repeat("дело сделано", &["дело сделано".into()]));
+    }
+
+    #[test]
+    fn journal_paths_without_a_directory_are_reported() {
+        // путь без каталога (имя прямо здесь): создавать нечего, а записать всё
+        // равно не выходит — это ошибка, а не паника
+        let p = std::path::Path::new("");
+        let rec = SentRecord { chat: 1, message_id: 2, ts: 3, kind: Kind::Answer, preview: "x".into() };
+        assert!(append_sent(p, &[rec.clone()]).is_err());
+        assert!(write_sent(p, &[rec.clone()]).is_err());
+        assert!(write_pid(p).is_err());
+        // пустая пачка журнала не должна ничего создавать вообще
+        assert!(append_sent(p, &[]).is_ok());
+    }
+
 }

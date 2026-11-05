@@ -8,6 +8,9 @@ use crate::backend::Backend;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Куда слать методы Bot API. По умолчанию — официальный адрес; своя строка
+    /// нужна тестам (подставной Telegram) и редким случаям «через свой прокси».
+    pub api_base: Option<String>,
     pub bot_token: String,
     pub allowed_users: HashSet<i64>,
     pub proxy_url: Option<String>,
@@ -44,6 +47,9 @@ pub struct Config {
     pub send_quiet_secs: u64,
     pub send_max_secs: u64,
     pub send_max_items: usize,
+    /// Срок годности сообщения в очереди: переждя его (лимит Telegram, отсутствие
+    /// связи), текст уходит в чат уже бессмысленным. 0 — очередь ждёт вечно.
+    pub send_ttl_secs: u64,
     /// Не отправлять в чат служебную болтовню вида «выполняю команду».
     pub drop_chatter: bool,
     /// Куда сохранять вложения из чата и сколько скачивать.
@@ -57,6 +63,10 @@ pub struct Config {
     /// предельного окна; 0 — начинать задачу сразу (старое поведение).
     pub agg_quiet_secs: u64,
     pub agg_window_secs: u64,
+    /// Сколько ждать прежнюю смену (процесс агента от прошлого запуска бота),
+    /// прежде чем поднять новую. По умолчанию 15 минут: зависший процесс не
+    /// должен останавливать чат навсегда.
+    pub shift_wait_secs: u64,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -100,6 +110,7 @@ impl Config {
             .unwrap_or(Backend::Claude);
 
         Ok(Self {
+            api_base: var("CLAUDETG_API_BASE"),
             bot_token,
             allowed_users,
             proxy_url,
@@ -143,6 +154,9 @@ impl Config {
             send_max_items: var("CLAUDETG_SEND_MAX_ITEMS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4usize),
+            send_ttl_secs: var("CLAUDETG_SEND_TTL_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1800),
             drop_chatter: var("CLAUDETG_DROP_CHATTER")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -164,6 +178,9 @@ impl Config {
             agg_window_secs: var("CLAUDETG_AGG_WINDOW_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            shift_wait_secs: var("CLAUDETG_SHIFT_WAIT_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900),
         })
     }
 }
@@ -194,23 +211,120 @@ mod tests {
         assert_eq!(Config::sibling(Path::new("state.json"), "bot.pid"), PathBuf::from("bot.pid"));
     }
 
+    /// Чистим переменные, которые читаем, чтобы тесты не зависели от порядка.
+    fn set_vars(vars: &[(&str, &str)]) {
+        for k in [
+            "TELEGRAM_BOT_TOKEN", "ALLOWED_USER_IDS", "PROXY_URL", "STATE_FILE",
+            "CLAUDETG_BACKEND", "CLAUDE_BIN", "CLAUDE_MODEL", "CLAUDE_EXTRA_ARGS",
+            "OPENCODE_BIN", "OPENCODE_MODEL", "OPENCODE_AGENT", "OPENCODE_AUTO",
+            "OPENCODE_EXTRA_ARGS", "SHOW_TOOLS", "CLAUDETG_API_BASE",
+            "CLAUDETG_SEND_QUIET_SECS", "CLAUDETG_SEND_MAX_SECS", "CLAUDETG_SEND_MAX_ITEMS",
+            "CLAUDETG_SEND_TTL_SECS", "CLAUDETG_DROP_CHATTER", "CLAUDETG_ATTACH_DIR",
+            "CLAUDETG_ATTACH_MAX_MB", "CLAUDETG_LIMIT_FALLBACK", "CLAUDE_PROJECTS_DIR",
+            "CLAUDETG_AGG_QUIET_SECS", "CLAUDETG_AGG_WINDOW_SECS", "CLAUDE_WORK_DIR",
+            "CLAUDE_PERMISSION_MODE",
+        ] {
+            std::env::remove_var(k);
+        }
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+    }
+
+    /// Одна проверка сразу для всех вариантов разбора: переменные окружения
+    /// общие на процесс, поэтому их нельзя трогать из нескольких тестов разом.
     #[test]
-    fn reads_settings_from_environment() {
-        // переменные задаём в одном процессе последовательно, чтобы не мешать
-        // другим тестам: берём редкие имена и проверяем разбор чисел
-        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
-        std::env::set_var("ALLOWED_USER_IDS", "7, 8");
-        std::env::set_var("CLAUDETG_SEND_QUIET_SECS", "3");
-        std::env::set_var("CLAUDETG_SEND_MAX_ITEMS", "9");
-        std::env::set_var("CLAUDETG_DROP_CHATTER", "0");
-        std::env::set_var("SHOW_TOOLS", "0");
-        std::env::set_var("STATE_FILE", "/tmp/claudetg-test/state.json");
+    fn environment_roundtrip() {
+        // 1) явные значения
+        set_vars(&[
+            ("TELEGRAM_BOT_TOKEN", "123:abc"),
+            ("ALLOWED_USER_IDS", "7, 8"),
+            ("PROXY_URL", "http://proxy:3128"),
+            ("OPENCODE_MODEL", "strata/other-model"),
+            ("OPENCODE_AGENT", "reviwer"),
+            ("CLAUDE_MODEL", "strata/big-model"),
+            ("CLAUDETG_SEND_QUIET_SECS", "3"),
+            ("CLAUDETG_SEND_MAX_ITEMS", "9"),
+            ("CLAUDETG_SEND_TTL_SECS", "0"),
+            ("CLAUDETG_DROP_CHATTER", "0"),
+            ("SHOW_TOOLS", "0"),
+            ("STATE_FILE", "/tmp/claudetg-test/state.json"),
+        ]);
         let cfg = super::Config::from_env().unwrap();
         assert_eq!(cfg.allowed_users.len(), 2);
+        // прокси и модель заданы словами — берём их, а не дефолт
+        assert_eq!(cfg.proxy_url.as_deref(), Some("http://proxy:3128"));
+        assert_eq!(cfg.opencode_model.as_deref(), Some("strata/other-model"));
+        assert_eq!(cfg.opencode_agent.as_deref(), Some("reviwer"));
+        assert_eq!(cfg.model.as_deref(), Some("strata/big-model"));
         assert_eq!(cfg.send_quiet_secs, 3);
         assert_eq!(cfg.send_max_items, 9);
+        // ttl=0 — срок годности отключён вручную
+        assert_eq!(cfg.send_ttl_secs, 0);
         assert!(!cfg.drop_chatter);
         assert!(!cfg.status_bubble);
         assert_eq!(cfg.outbox_dir, PathBuf::from("/tmp/claudetg-test/outbox"));
+
+        // 2) флаги, списки аргументов и дефолты
+        set_vars(&[
+            ("TELEGRAM_BOT_TOKEN", "123:abc"),
+            ("ALLOWED_USER_IDS", "7"),
+            ("PROXY_URL", "none"),
+            ("STATE_FILE", "/tmp/claudetg-test2/state.json"),
+            ("CLAUDETG_BACKEND", "opencode"),
+            ("CLAUDETG_API_BASE", "http://127.0.0.1:8080"),
+            ("OPENCODE_MODEL", "none"),
+            ("OPENCODE_AUTO", "false"),
+            ("SHOW_TOOLS", "false"),
+            ("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions  --verbose"),
+            ("CLAUDETG_ATTACH_MAX_MB", "5"),
+            ("CLAUDETG_LIMIT_FALLBACK", "false"),
+            ("CLAUDETG_AGG_QUIET_SECS", "не число"),
+        ]);
+        let cfg = super::Config::from_env().unwrap();
+        assert_eq!(cfg.backend, crate::backend::Backend::OpenCode);
+        // PROXY_URL=none — прокси отключён явно
+        assert!(cfg.proxy_url.is_none());
+        assert_eq!(cfg.api_base.as_deref(), Some("http://127.0.0.1:8080"));
+        // OPENCODE_MODEL=none — модель не подставляется
+        assert!(cfg.opencode_model.is_none());
+        assert!(!cfg.opencode_auto);
+        assert!(!cfg.status_bubble);
+        assert!(!cfg.limit_fallback);
+        // список аргументов режется по пробелам
+        assert_eq!(cfg.extra_args, vec!["--dangerously-skip-permissions", "--verbose"]);
+        assert_eq!(cfg.attach_max_mb, 5);
+        // мусор в числах — дефолт, а не падение
+        assert_eq!(cfg.agg_quiet_secs, 12);
+        // файлы состояния живут рядом с STATE_FILE
+        assert_eq!(cfg.sent_log, PathBuf::from("/tmp/claudetg-test2/sent.jsonl"));
+
+        // 3) ошибки настройки
+        set_vars(&[]);
+        let err = format!("{}", super::Config::from_env().unwrap_err());
+        assert!(err.contains("TELEGRAM_BOT_TOKEN"), "{err}");
+        set_vars(&[("TELEGRAM_BOT_TOKEN", "123:abc"), ("ALLOWED_USER_IDS", "7, abc")]);
+        let err = format!("{}", super::Config::from_env().unwrap_err());
+        assert!(err.contains("ALLOWED_USER_IDS"), "{err}");
+        set_vars(&[("TELEGRAM_BOT_TOKEN", "123:abc"), ("ALLOWED_USER_IDS", "7"), ("CLAUDETG_BACKEND", "gpt")]);
+        let err = format!("{}", super::Config::from_env().unwrap_err());
+        assert!(err.contains("непонятный агент"), "{err}");
+
+        // 4) голые обязательные переменные — дефолты остального
+        set_vars(&[("TELEGRAM_BOT_TOKEN", "123:abc"), ("ALLOWED_USER_IDS", "7")]);
+        let cfg = super::Config::from_env().unwrap();
+        assert_eq!(cfg.proxy_url.as_deref(), Some("http://localhost:3128"));
+        assert_eq!(cfg.claude_bin, "claude");
+        assert_eq!(cfg.opencode_model.as_deref(), Some("strata/qwen3.8-flash-next-iq3_s"));
+        assert_eq!(cfg.send_ttl_secs, 1800);
+        assert!(cfg.limit_fallback);
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        std::env::remove_var("ALLOWED_USER_IDS");
+    }
+
+    #[test]
+    fn args_list_splits_on_whitespace() {
+        assert_eq!(super::split_args(Some("a  b\tc".into())), vec!["a", "b", "c"]);
+        assert!(super::split_args(None).is_empty());
     }
 }
