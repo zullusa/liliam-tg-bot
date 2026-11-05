@@ -1068,6 +1068,12 @@ async fn handle_command(app: &Arc<App>, chat_id: i64, cmd: &str, arg: &str) {
                     "\nЗамещение: {main} дожидается лимита, смену ведёт {}, автовозврат в {label}",
                     backend.name()
                 ),
+                (Some(main), None) => format!(
+                    "\nЗамещение: {main} заблокирован Anthropic до проверки аккаунта, \
+                     смену ведёт {}, возврат вручную: /backend {}",
+                    backend.name(),
+                    main.name()
+                ),
                 _ => String::new(),
             };
             let text = format!(
@@ -1382,6 +1388,13 @@ async fn run_turn(app: &Arc<App>, chat_id: i64, prompt: String, cancel: Arc<Noti
             app.queue(chat_id, Kind::Answer, &text).await;
             app.drain_outbox(chat_id).await;
             record_turn(app, chat_id, logged_user, trunc(&text, 400), in_fallback).await;
+            // Аккаунт заблокирован Anthropic до проверки: сброса не будет,
+            // и продолжение по расписанию только повторит ту же ошибку.
+            if backend == Backend::Claude
+                && outcome.api_error_code.as_deref() == Some("verification_required")
+            {
+                return hand_over_blocked_claude(app, chat_id).await;
+            }
             return schedule_resume_if_limited(app, chat_id, &text).await;
         }
         // Ошибки смены тоже через очередь: если связи нет в этот момент,
@@ -1422,6 +1435,21 @@ fn brief(text: &str, n: usize) -> String {
     trunc(&text.split_whitespace().collect::<Vec<_>>().join(" "), n)
 }
 
+/// Контекст для передачи другому агенту: расшифровка файла сессии claude,
+/// а если файла нет (сессия на другой машине) — то, что помнит сам бот.
+fn claude_context(app: &App, state: &ChatState) -> Option<String> {
+    let context = state
+        .session_id
+        .as_deref()
+        .and_then(|sid| {
+            handoff::claude_transcript(&app.cfg.claude_projects_dir, sid, handoff::MAX_TRANSCRIPT_CHARS)
+        })
+        // Файл сессии не найден (например, claude работает на другой машине) —
+        // берём то, что помнит сам бот.
+        .unwrap_or_else(|| handoff::render_turns(&state.recent, handoff::MAX_TRANSCRIPT_CHARS));
+    (!context.is_empty()).then_some(context)
+}
+
 /// Агент упёрся в лимит — запланировать продолжение.
 ///
 /// Если лимит у claude и замещение включено: сразу передать контекст opencode,
@@ -1437,16 +1465,7 @@ async fn schedule_resume_if_limited(app: &Arc<App>, chat_id: i64, text: &str) ->
     let backend = state.backend.unwrap_or(app.cfg.backend);
 
     let handoff_text = if backend == Backend::Claude && app.cfg.limit_fallback {
-        let context = state
-            .session_id
-            .as_deref()
-            .and_then(|sid| {
-                handoff::claude_transcript(&app.cfg.claude_projects_dir, sid, handoff::MAX_TRANSCRIPT_CHARS)
-            })
-            // Файл сессии не найден (например, claude работает на другой машине) —
-            // берём то, что помнит сам бот.
-            .unwrap_or_else(|| handoff::render_turns(&state.recent, handoff::MAX_TRANSCRIPT_CHARS));
-        (!context.is_empty()).then_some(context)
+        claude_context(app, &state)
     } else {
         None
     };
@@ -1484,6 +1503,40 @@ async fn schedule_resume_if_limited(app: &Arc<App>, chat_id: i64, text: &str) ->
             )
             .await;
     }
+    switched
+}
+
+/// claude заблокирован Anthropic до проверки аккаунта («verification_required»):
+/// это не лимит — сброс не наступит, а автопродолжение и повторные попытки
+/// дадут ту же ошибку. Передаём ход opencode, а куда вернуться — решает человек.
+/// Возвращает true, если чат переключён на замещение (run_agent начнёт смену).
+async fn hand_over_blocked_claude(app: &Arc<App>, chat_id: i64) -> bool {
+    let state = app.chat_state(chat_id).await;
+    let context = app.cfg.limit_fallback.then(|| claude_context(app, &state)).flatten();
+    let switched = context.is_some();
+    app.update_chat(chat_id, |s| {
+        s.resume_at = None;
+        s.resume_label = None;
+        if let Some(context) = context {
+            s.handoff = Some(context);
+            s.fallback_from = Some(Backend::Claude);
+            s.backend = Some(Backend::OpenCode);
+        }
+    })
+    .await;
+    log::warn!(
+        "chat {chat_id}: claude blocked by Anthropic until account verification, fallback={switched}"
+    );
+    let note = if switched {
+        "🛑 Anthropic заблокировал аккаунт до проверки: claude не ответит, пока аккаунт не пройдёт \
+         верификацию на портале (ссылка в сообщении выше). Ждать сброса бессмысленно. \
+         Передаю контекст opencode и продолжаю с ним; прошёл проверку — возвращайся командой /backend claude."
+    } else {
+        "🛑 Anthropic заблокировал аккаунт до проверки: claude не ответит, пока аккаунт не пройдёт \
+         верификацию на портале (ссылка в сообщении выше). Ждать сброса бессмысленно — \
+         пройди проверку или переключайся на /backend opencode."
+    };
+    app.bot.send_text(chat_id, note).await;
     switched
 }
 
@@ -1694,7 +1747,10 @@ mod tests {
 
     #[tokio::test]
     async fn expired_queue_items_never_reach_the_chat() {
-        let (app, tg) = e2e("ttl");
+        // агент — подстава: тест про очередь, а не про настоящую модель,
+        // живой claude дёргать нечем (и бессмысленно)
+        let agent = fake_agent("ttl", &[r#"{"type":"result","result":"свежий ответ"}"#], 0, false);
+        let (app, tg) = e2e_agent("ttl", &agent);
         let path = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "старый ответ из прошлого вечера")).unwrap();
         // помечаем запись как часовую давность: лимит Telegram задержал очередь
         let raw = std::fs::read_to_string(&path).unwrap().replace("\"ts\":", "\"ts\": 1, \"_x\":");
@@ -1914,6 +1970,56 @@ mod tests {
         assert!(agent_prompt(&oc).contains(handoff::HANDOFF_HEADER), "opencode получил контекст claude");
         assert!(agent_prompt(&oc).contains("продолжай"));
         assert!(tg2.calls("sendMessage").iter().any(|s| s.contains("Смена подхвачена")));
+    }
+
+    /// Строка result настоящего claude при блокировке аккаунта Anthropic
+    /// до подтверждения личности (код ошибки verification_required).
+    const VERIFICATION_RESULT: &str = r#"{"type":"result","is_error":true,"api_error_status":403,"api_error_code":"verification_required","result":"API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify?org=x"}"#;
+
+    #[tokio::test]
+    async fn blocked_account_hands_work_over_without_a_schedule() {
+        let agent = fake_agent(
+            "blocked",
+            &[
+                r#"{"type":"assistant","session_id":"sess-v1","message":{"content":[{"type":"text","text":"работаю"}]}}"#,
+                VERIFICATION_RESULT,
+            ],
+            0, false,
+        );
+        let (app, tg) = e2e_with("blocked", |c| {
+            c.limit_fallback = true;
+            c.claude_bin = agent.display().to_string();
+            c.opencode_bin = agent.display().to_string();
+        });
+        std::fs::create_dir_all(&app.cfg.claude_projects_dir).unwrap();
+        let transcript = [
+            r#"{"type":"user","message":{"content":"собери релиз"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"собираю"}]}}"#,
+        ].join("\n");
+        std::fs::write(app.cfg.claude_projects_dir.join("sess-v1.jsonl"), transcript).unwrap();
+
+        let shifted = run_turn(&app, 11, "дело".into(), Arc::new(Notify::new())).await;
+        assert!(shifted, "чат переключён на замещение: sent={:?}", tg.calls("sendMessage"));
+        let state = app.chat_state(11).await;
+        assert_eq!(state.backend, Some(Backend::OpenCode));
+        assert_eq!(state.fallback_from, Some(Backend::Claude));
+        assert!(state.resume_at.is_none(), "автовозврат не планируем — времени сброса нет");
+        assert!(state.handoff.as_deref().unwrap().contains("собери релиз"), "контекст claude собран");
+        let sent = tg.calls("sendMessage");
+        assert!(sent.iter().any(|s| s.contains("portal.anthropic.com")), "ссылка портала ушла в чат");
+        assert!(sent.iter().any(|s| s.contains("заблокировал аккаунт") && s.contains("/backend claude")), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn blocked_account_without_fallback_explains_and_does_not_reschedule() {
+        let agent = fake_agent("blocked-off", &[VERIFICATION_RESULT], 0, false);
+        let (app, tg) = e2e_agent("blocked-off", &agent);
+        let shifted = run_turn(&app, 11, "дело".into(), Arc::new(Notify::new())).await;
+        assert!(!shifted, "замещение выключено — никто сам не стартует");
+        let state = app.chat_state(11).await;
+        assert_eq!(state.backend, None, "чат остался на claude");
+        assert!(state.resume_at.is_none(), "повтор по расписанию не ставим");
+        assert!(tg.calls("sendMessage").iter().any(|s| s.contains("/backend opencode")));
     }
 
     #[tokio::test]

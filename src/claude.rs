@@ -67,7 +67,7 @@ pub async fn run(
     });
 
     let mut lines = BufReader::new(child.stdout.take().context("no stdout")?).lines();
-    let mut outcome = Outcome { session_id: session_id.map(String::from), text: String::new(), is_error: false, cost_usd: None };
+    let mut outcome = Outcome { session_id: session_id.map(String::from), text: String::new(), is_error: false, cost_usd: None, api_error_code: None };
     let mut last_assistant_text = String::new();
     let mut got_result = false;
 
@@ -110,6 +110,7 @@ pub async fn run(
                 got_result = true;
                 outcome.is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                 outcome.cost_usd = v.get("total_cost_usd").and_then(Value::as_f64);
+                outcome.api_error_code = v.get("api_error_code").and_then(Value::as_str).map(String::from);
                 outcome.text = v
                     .get("result")
                     .and_then(Value::as_str)
@@ -317,6 +318,27 @@ mod tests {
         .expect("запускается");
         assert!(out.is_error);
         assert_eq!(out.text, "упало");
+    }
+
+    #[tokio::test]
+    async fn api_error_code_is_carried_out_of_result() {
+        // строка result при блокировке аккаунта Anthropic несёт код ошибки —
+        // по нему бот отличает «подожди сброса» от «бесполезно ждать»
+        let agent = fake_agent(
+            "cl-apierr",
+            &[r#"{"type":"result","is_error":true,"api_error_code":"verification_required","result":"API Error: verification"}"#],
+            0, false,
+        );
+        let cfg = cfg_for("cl-apierr", &agent);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = super::run(
+            &cfg, &cfg.work_dir, 11, None, "дело", tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("запускается");
+        assert!(out.is_error);
+        assert_eq!(out.api_error_code.as_deref(), Some("verification_required"));
     }
 
     #[tokio::test]

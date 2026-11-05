@@ -72,7 +72,7 @@ pub async fn run(
     });
 
     let mut lines = BufReader::new(child.stdout.take().context("no stdout")?).lines();
-    let mut outcome = Outcome { session_id: session_id.map(String::from), text: String::new(), is_error: false, cost_usd: None };
+    let mut outcome = Outcome { session_id: session_id.map(String::from), text: String::new(), is_error: false, cost_usd: None, api_error_code: None };
     let mut last_text = String::new();
     let mut error_text = String::new();
     let mut cost_total = 0.0;

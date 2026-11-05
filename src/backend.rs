@@ -60,6 +60,9 @@ pub struct Outcome {
     pub text: String,
     pub is_error: bool,
     pub cost_usd: Option<f64>,
+    /// Код ошибки API из вывода бэкенда: «verification_required» (аккаунт
+    /// заблокирован Anthropic до проверки), «rate_limit», … и None в норме.
+    pub api_error_code: Option<String>,
 }
 
 pub const SYSTEM_PROMPT: &str = "You are talking with the user through a Telegram bot. \
