@@ -503,14 +503,22 @@ async fn cli_send_file(bot: &Bot, cfg: &Config, env_chat: Option<&str>, rest: &[
         .ok_or_else(|| anyhow::anyhow!("{usage}: chat id not set (CLAUDETG_CHAT_ID)"))?;
     let path = rest.first().ok_or_else(|| anyhow::anyhow!("{usage}"))?;
     let caption = rest.get(1).map(String::as_str).unwrap_or("");
+    // путь делаем абсолютным: очередь читает бот, а у него другая рабочая
+    // директория, чем у процесса, который файл присылает
+    let path = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let path = path.display().to_string();
     if outbox::bot_alive(&cfg.pid_file) {
-        outbox::enqueue(&cfg.outbox_dir, &Item::file(chat_id, Kind::Agent, path, caption))?;
+        outbox::enqueue(&cfg.outbox_dir, &Item::file(chat_id, Kind::Agent, &path, caption))?;
         log::info!("файл поставлен в очередь: {}", cfg.outbox_dir.display());
         Ok(())
     } else {
         log::warn!("бот не работает ({}), отправляем напрямую", cfg.pid_file.display());
         let caption = (!caption.is_empty()).then_some(caption);
-        bot.send_document(chat_id, std::path::Path::new(path), caption).await?;
+        bot.send_document(chat_id, std::path::Path::new(&path), caption).await?;
         Ok(())
     }
 }
@@ -2592,6 +2600,30 @@ mod tests {
         assert_eq!(texts.last().unwrap(), "ответ 12", "свежее — в конце");
         assert!(!texts.contains(&"ответ 1".to_string()), "старое выброшено");
     }
+    #[tokio::test]
+    async fn a_relative_file_path_becomes_absolute_in_the_queue() {
+        // `claudetg send-file отчёт.apk` из чужой директории: бот читает очередь
+        // сам, и относительный путь для него потерян
+        let (app, _tg) = e2e("filerel");
+        outbox::write_pid(&app.cfg.pid_file).expect("pid-файл живого бота");
+        let dir = std::env::temp_dir().join(format!("claudetg-filerel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("otchet.txt"), "dannye").unwrap();
+        let saved = std::env::current_dir().expect("текущая директория");
+        std::env::set_current_dir(&dir).expect("заходим в каталог с файлом");
+        let res = cli_send_file(&app.bot, &app.cfg, Some("11"), &["otchet.txt".into(), "издалека".into()]).await;
+        std::env::set_current_dir(&saved).expect("возвращаемся");
+        res.expect("команда проходит");
+        let queued = outbox::pending(&app.cfg.outbox_dir);
+        assert_eq!(queued.len(), 1, "файл в очереди");
+        let stored = queued[0].1.path.clone().unwrap();
+        assert!(stored.is_absolute(), "путь абсолютный: {stored:?}");
+        assert_eq!(stored, dir.join("otchet.txt"), "путь указывает на тот же файл");
+        assert!(stored.exists(), "по пути в очереди файл находится");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn queue_files_go_to_the_chat_and_journal() {
         // живой бот: send-file не лезет в сеть сам, а ставит файл в очередь —

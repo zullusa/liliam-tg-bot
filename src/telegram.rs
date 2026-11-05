@@ -957,8 +957,10 @@ mod tests {
 
     #[tokio::test]
     async fn file_download_retries_a_route_that_does_not_reach() {
-        // адрес, где никто не слушает: сетевой сбой повторяем до трёх раз
-        let dead_addr = crate::testkit::dead_endpoint();
+        // адрес, где никто не слушает: сетевой сбой повторяем до трёх раз.
+        // Здесь нужен именно отказ в подключении (порт свободен), а не обрыв:
+        // тогда текст ошибки постоянен и проверка не зависит от нагрузки
+        let dead_addr = crate::testkit::refused_endpoint();
         let bot = Bot::new("TOK", None, Some(&format!("http://{dead_addr}"))).unwrap();
         let file = FileRef {
             file_id: "F1".into(),
@@ -970,8 +972,7 @@ mod tests {
         };
         let dest = std::env::temp_dir().join("claudetg-dl-dead.bin");
         let err = format!("{:#}", bot.download(&file, &dest).await.unwrap_err());
-        let transport_fail = err.contains("Connection refused") || err.contains("connection closed");
-        assert!(err.contains("getFile") && transport_fail, "{err}");
+        assert!(err.contains("getFile") && err.contains("Connection refused"), "{err}");
         let _ = std::fs::remove_file(&dest);
     }
 

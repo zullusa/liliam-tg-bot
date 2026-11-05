@@ -22,6 +22,8 @@ MIN_FILE_LINES="${MIN_FILE_LINES:-91}"
 # съедают место и мешают следующим прогонам.
 find /tmp -maxdepth 1 -name 'claudetg-*' -mmin +20 -exec rm -rf {} + 2>/dev/null || true
 
+# вывод не глушим: иначе конвейер спрячет неудачу тестов, и гейт «пройдёт»
+# при падающих проверках
 cargo llvm-cov --summary-only \
     --fail-under-lines "$MIN_LINES" \
     --fail-under-file-lines "$MIN_FILE_LINES"

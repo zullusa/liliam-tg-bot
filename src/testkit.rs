@@ -132,6 +132,16 @@ pub const DROP: &str = "@@drop";
 /// ответа. Держать просто незакрытый слушатель нельзя — запрос висел бы до
 /// таймаута, а освободившийся порт перехватывает подставной сервер другого
 /// теста и «мёртвый» адрес становится живым.
+/// Порт, на котором никто не слушает: слушатель создано-снят, соединение будет
+/// отклонено сразу и одинаково — так проверяют ветку «связи нет» без гонок.
+pub fn refused_endpoint() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("порт для отказа");
+    // слушатель не используется и сразу закрывается: порт свободен, ответ — отказ
+    let addr = listener.local_addr().expect("адрес отказа");
+    drop(listener);
+    addr
+}
+
 pub fn dead_endpoint() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("порт без связи");
     let addr = listener.local_addr().expect("адрес без связи");

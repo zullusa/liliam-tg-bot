@@ -186,6 +186,33 @@ fn send_file_from_the_command_line_uses_the_chat_from_the_environment() {
     assert_eq!(entries.len(), 1, "файл в очереди: {entries:?}");
     let body = std::fs::read_to_string(format!("{dir}/outbox/{}", entries[0])).unwrap();
     assert!(body.contains("отчёт.txt") && body.contains("в очередь"), "{body}");
+
+    // относительный путь: бот читает очередь из своей директории, поэтому в
+    // очередь должен лечь абсолютный путь
+    let rel = run(
+        &["send-file", "отчёт.txt", "относительный путь"],
+        &[
+            ("TELEGRAM_BOT_TOKEN", "123:abc"),
+            ("ALLOWED_USER_IDS", "7"),
+            ("PROXY_URL", "none"),
+            ("CLAUDETG_API_BASE", &format!("http://{addr}")),
+            ("CLAUDETG_CHAT_ID", "11"),
+            ("STATE_FILE", &format!("{dir}/state.json")),
+        ],
+    );
+    assert!(rel.status.success(), "{}", String::from_utf8_lossy(&rel.stderr));
+    let entries: Vec<String> = std::fs::read_dir(format!("{dir}/outbox"))
+        .expect("очередь")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries.len(), 2, "оба файла в очереди: {entries:?}");
+    let bodies: Vec<String> = entries
+        .iter()
+        .map(|n| std::fs::read_to_string(format!("{dir}/outbox/{n}")).unwrap())
+        .collect();
+    let joined = bodies.join("\n");
+    assert!(joined.contains(&format!("\"path\":\"{file}\"")), "путь абсолютный: {joined}");
     let _ = std::fs::remove_file(format!("{dir}/bot.pid"));
 
     // а без чата команда объясняет, как её вызывать, и не лезет в сеть
