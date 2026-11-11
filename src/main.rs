@@ -1724,6 +1724,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commands_from_unauthorized_users_are_ignored_too() {
+        // «а что делает /help» от чужого — тоже игнор: ни ответа, ни очереди,
+        // ни одной строчки статуса; наличие списка id — единственные ворота
+        let (app, tg) = e2e("unauth-cmd");
+        for cmd in ["/help", "/status", "/backend opencode", "/cancel"] {
+            handle_message(app.clone(), message_of(&update_text(1, 11, 999, cmd))).await;
+        }
+        assert!(tg.requests().is_empty(), "чужой не выбил ни одного ответа");
+        assert!(outbox::pending(&app.cfg.outbox_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_names_cannot_escape_the_download_dir() {
+        // имя файла приходит из ответа Telegram (и его может подсунуть прокси):
+        // «../» и слеши не должны дать записать файл вне папки загрузок
+        let (app, _tg) = e2e("escape");
+        for nasty in ["../../../etc/evil.txt", "..\\..\\evil.txt", "..", ".", "/etc/passwd"] {
+            let update = serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 5,
+                        "chat": { "id": 11 },
+                        "from": { "id": 7 },
+                        "document": { "file_id": "D1", "file_size": 4, "file_name": nasty },
+                    }
+                }]
+            });
+            let msg = message_of(&update.to_string());
+            let saved = save_attachments(&app, 11, &msg).await;
+            assert_eq!(saved.len(), 1, "{nasty}: вложение скачано");
+            assert_eq!(
+                saved[0].local.parent().unwrap(),
+                app.cfg.attach_dir,
+                "{nasty}: файл остался в папке загрузок"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn empty_message_asks_for_text_or_file() {
         let (app, tg) = e2e("empty");
         handle_message(app.clone(), message_of(&update_text(1, 11, 7, "   "))).await;
