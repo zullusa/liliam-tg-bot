@@ -34,6 +34,9 @@ pub struct Config {
     /// Пузырь статуса в чате: одно сообщение, которое бот обновляет вместо
     /// потока «выполняю команду». Показывается ли он — `status_bubble`.
     pub status_bubble: bool,
+    /// Минимальный интервал между правками пузыря (editMessageText): частые
+    /// правки — то, за что Telegram заводит долгие паузы.
+    pub bubble_edit_secs: u64,
     pub state_file: PathBuf,
     /// Каталог исходящей очереди (`claudetg send` и ответы агента складываются
     /// туда, бот отправляет их пачкой — меньше сообщений в чате).
@@ -141,6 +144,9 @@ impl Config {
             status_bubble: var("SHOW_TOOLS")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
+            bubble_edit_secs: var("CLAUDETG_BUBBLE_EDIT_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
             state_file: state_file.clone(),
             outbox_dir: Self::sibling(&state_file, "outbox"),
             sent_log: Self::sibling(&state_file, "sent.jsonl"),
@@ -222,7 +228,7 @@ mod tests {
             "CLAUDETG_SEND_TTL_SECS", "CLAUDETG_DROP_CHATTER", "CLAUDETG_ATTACH_DIR",
             "CLAUDETG_ATTACH_MAX_MB", "CLAUDETG_LIMIT_FALLBACK", "CLAUDE_PROJECTS_DIR",
             "CLAUDETG_AGG_QUIET_SECS", "CLAUDETG_AGG_WINDOW_SECS", "CLAUDE_WORK_DIR",
-            "CLAUDE_PERMISSION_MODE",
+            "CLAUDE_PERMISSION_MODE", "CLAUDETG_BUBBLE_EDIT_SECS",
         ] {
             std::env::remove_var(k);
         }
@@ -246,6 +252,7 @@ mod tests {
             ("CLAUDETG_SEND_QUIET_SECS", "3"),
             ("CLAUDETG_SEND_MAX_ITEMS", "9"),
             ("CLAUDETG_SEND_TTL_SECS", "0"),
+            ("CLAUDETG_BUBBLE_EDIT_SECS", "2"),
             ("CLAUDETG_DROP_CHATTER", "0"),
             ("SHOW_TOOLS", "0"),
             ("STATE_FILE", "/tmp/claudetg-test/state.json"),
@@ -261,6 +268,7 @@ mod tests {
         assert_eq!(cfg.send_max_items, 9);
         // ttl=0 — срок годности отключён вручную
         assert_eq!(cfg.send_ttl_secs, 0);
+        assert_eq!(cfg.bubble_edit_secs, 2);
         assert!(!cfg.drop_chatter);
         assert!(!cfg.status_bubble);
         assert_eq!(cfg.outbox_dir, PathBuf::from("/tmp/claudetg-test/outbox"));
@@ -317,6 +325,7 @@ mod tests {
         assert_eq!(cfg.claude_bin, "claude");
         assert_eq!(cfg.opencode_model.as_deref(), Some("strata/qwen3.8-flash-next-iq3_s"));
         assert_eq!(cfg.send_ttl_secs, 1800);
+        assert_eq!(cfg.bubble_edit_secs, 5);
         assert!(cfg.limit_fallback);
         std::env::remove_var("TELEGRAM_BOT_TOKEN");
         std::env::remove_var("ALLOWED_USER_IDS");

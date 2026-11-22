@@ -295,6 +295,7 @@ pub fn test_config_fresh(tag: &str, api_base: &str, wipe: bool) -> Config {
         opencode_auto: true,
         opencode_extra_args: Vec::new(),
         status_bubble: false,
+        bubble_edit_secs: 1,
         state_file: dir.join("state.json"),
         outbox_dir: dir.join("outbox"),
         sent_log: dir.join("sent.jsonl"),

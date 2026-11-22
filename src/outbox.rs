@@ -138,14 +138,28 @@ pub fn due_chats(items: &[(PathBuf, Item)], now: i64, policy: &Policy) -> Vec<i6
 /// связи не было). Отправлять их через час после смысла уже нет — человек
 /// получает «старые ответы», которые он видел в живой переписке. Такие снимаем
 /// с очереди и пишем в журнал, сколько и почему убрали. `ttl_ms <= 0` — срок
-/// отключён, очередь ждёт сколько угодно.
+/// отключён, очередь ждёт сколько угодно. Исключение — финальный ответ агента
+/// (`Answer`): его Telegram и держал, это именно тот результат, которого ждёт
+/// человек, выбросить его на выходе бессмысленнее всего.
 pub fn stale_paths(items: &[(PathBuf, Item)], now: i64, ttl_ms: i64) -> Vec<PathBuf> {
     if ttl_ms <= 0 {
         return Vec::new();
     }
     items
         .iter()
-        .filter(|(_, it)| now - it.ts > ttl_ms)
+        .filter(|(_, it)| it.kind != Kind::Answer && now - it.ts > ttl_ms)
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
+/// Промежуточные записи очереди, которым не место в чате после разблокировки:
+/// служебные заметки («задача принята», окна агрегации). Их снимают с отправки,
+/// когда пауза Telegram кончается: за время запрета человек и так видел, чем
+/// занят агент, а ответы и сообщения агента (`Answer`/`Agent`) остаются.
+pub fn intermediate_paths(items: &[(PathBuf, Item)]) -> Vec<PathBuf> {
+    items
+        .iter()
+        .filter(|(_, it)| it.kind == Kind::Note)
         .map(|(p, _)| p.clone())
         .collect()
 }
@@ -394,20 +408,37 @@ mod tests {
     }
 
     #[test]
-    fn stale_items_leave_the_queue() {
+    fn stale_items_leave_the_queue_but_the_answer_waits_out_the_ban() {
         let dir = std::env::temp_dir().join(format!("claudetg-stale-{}", now_ms()));
         let _ = std::fs::remove_dir_all(&dir);
-        // час назад — протухло, две минуты назад — ещё нужно
+        // час назад: заметка протхла, а финальный ответ пережидает любой запрет —
+        // именно его человек и ждёт после разблокировки
+        enqueue(&dir, &item(1, 0, Kind::Note, "старая заметка")).unwrap();
         enqueue(&dir, &item(1, 0, Kind::Answer, "очень старый ответ")).unwrap();
-        enqueue(&dir, &item(1, 58 * 60_000, Kind::Agent, "свежий")).unwrap();
+        // сообщение агента старше срока уходит, как и раньше
+        enqueue(&dir, &item(1, 0, Kind::Agent, "простроченный анонс")).unwrap();
         let all = pending(&dir);
         let stale = stale_paths(&all, 60 * 60_000, 30 * 60_000);
-        assert_eq!(stale.len(), 1);
+        assert_eq!(stale.len(), 2, "протухли заметка и анонс: {stale:?}");
         discard(&stale);
-        assert_eq!(pending(&dir).len(), 1);
+        let left = pending(&dir);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].1.text, "очень старый ответ");
         // ttl=0 — срок отключён, не протухает ничего
         assert!(stale_paths(&pending(&dir), i64::MAX, 0).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_notes_are_intermediate_after_a_pause() {
+        let items = vec![
+            (PathBuf::from("a"), item(1, 100, Kind::Note, "🕐 задача принята")),
+            (PathBuf::from("b"), item(1, 110, Kind::Agent, "готовый выпуск")),
+            (PathBuf::from("c"), item(1, 120, Kind::Answer, "итог замера")),
+            (PathBuf::from("d"), Item::file(1, Kind::Answer, "/tmp/release.apk", "файл")),
+        ];
+        let junk = intermediate_paths(&items);
+        assert_eq!(junk, vec![PathBuf::from("a")], "снимаются только служебные заметки");
     }
 
     #[test]

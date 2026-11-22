@@ -209,6 +209,14 @@ impl App {
             bubble.started.get_or_insert_with(tokio::time::Instant::now);
             (bubble.render(), bubble.message_id)
         };
+        // Telegram завёл паузу: пузырь к API не обращается вовсе. Правки и отправки
+        // внутри запрета всё равно отвергаются, каждая неудача льёт в журнал ошибку
+        // (это и был поток «sendMessage: пауза Telegram ещё N с» каждые 4 секунды),
+        // а сами попытки лишь продлевают запрет. Состояние пузыря уже обновлено под
+        // замком: строка сравняется с реальностью, когда запрет кончится.
+        if self.bot.send_paused() {
+            return;
+        }
         let keep = if let Some(id) = message_id {
             if self.bot.edit_text(chat_id, id, &text).await {
                 Some(id)
@@ -241,7 +249,7 @@ impl App {
                 bubble.line = line.to_string();
                 bubble
                     .rendered
-                    .map(|t| t.elapsed() >= Duration::from_millis(1500))
+                    .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.bubble_edit_secs.max(1)))
                     .unwrap_or(true)
             }
         };
@@ -1245,6 +1253,15 @@ async fn flush_outbox(app: Arc<App>) {
         if waiting {
             waiting = false;
             log::info!("пауза Telegram закончилась, очередь снова идёт");
+            // Пока чат молчал под запретом, в очереди копилось в основном
+            // промежуточное: служебные заметки и анонсы шагов. Человек ждёт результат
+            // работы — снимем с отправки всё служебное, чтобы после разблокировки
+            // в чат ушли только ответы и сообщения агента.
+            let junk = outbox::intermediate_paths(&outbox::pending(&app.cfg.outbox_dir));
+            if !junk.is_empty() {
+                log::info!("очередь после паузы: {} служебных сообщений в чат не уйдут", junk.len());
+                outbox::discard(&junk);
+            }
         }
         let items = outbox::pending(&app.cfg.outbox_dir);
         if items.is_empty() {
@@ -1792,7 +1809,7 @@ mod tests {
         // живой claude дёргать нечем (и бессмысленно)
         let agent = fake_agent("ttl", &[r#"{"type":"result","result":"свежий ответ"}"#], 0, false);
         let (app, tg) = e2e_agent("ttl", &agent);
-        let path = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "старый ответ из прошлого вечера")).unwrap();
+        let path = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Agent, "старый анонс из прошлого вечера")).unwrap();
         // помечаем запись как часовую давность: лимит Telegram задержал очередь
         let raw = std::fs::read_to_string(&path).unwrap().replace("\"ts\":", "\"ts\": 1, \"_x\":");
         std::fs::write(path, raw).unwrap();
@@ -1802,6 +1819,25 @@ mod tests {
         // свежий ответ уходит нормально
         run_turn(&app, 11, "дело".into(), Arc::new(Notify::new())).await;
         assert_eq!(tg.calls("sendMessage").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_old_answer_waits_out_the_ban_instead_of_rotting() {
+        // лимит Telegram продержал очередь полночи: промежуточное протхло,
+        // а итоговый ответ дошёл — именно его человек и ждал
+        let (app, tg) = e2e_with("ttlanswer", |c| c.send_ttl_secs = 60);
+        let path = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "итог ночного замера")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap().replace("\"ts\":", "\"ts\": 1, \"_x\":");
+        std::fs::write(&path, raw).unwrap();
+        let note = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Note, "🕐 задача принята")).unwrap();
+        let raw = std::fs::read_to_string(&note).unwrap().replace("\"ts\":", "\"ts\": 1, \"_x\":");
+        std::fs::write(&note, raw).unwrap();
+        app.drain_outbox(11).await;
+        let sent = tg.calls("sendMessage");
+        assert_eq!(sent.len(), 1, "ответ живёт сверх срока, заметка — нет: {sent:?}");
+        assert!(sent[0].contains("итог ночного замера"), "{sent:?}");
+        assert!(!sent[0].contains("задача принята"), "просроченная заметка не ушла: {sent:?}");
+        assert!(outbox::pending(&app.cfg.outbox_dir).is_empty(), "очередь разобрана");
     }
 
     #[tokio::test]
@@ -2330,14 +2366,17 @@ mod tests {
 
     #[tokio::test]
     async fn status_bubble_is_created_edited_and_removed() {
-        let (app, tg) = e2e_with("bubble", |c| c.status_bubble = true);
+        let (app, tg) = e2e_with("bubble", |c| {
+            c.status_bubble = true;
+            c.bubble_edit_secs = 1;
+        });
         assert!(tg.requests().is_empty());
         app.status(11, "Читаю файл: main.rs").await;
         let sent = tg.calls("sendMessage");
         assert_eq!(sent.len(), 1, "пузырь — одно сообщение");
         assert!(sent[0].contains("Читаю файл"));
-        // пузырь правят не чаще, чем раз в 1,5 с — выжидаем паузу
-        tokio::time::sleep(Duration::from_millis(1600)).await;
+        // пузырь правят не чаще, чем раз в bubble_edit_secs — выжидаем паузу
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         app.status_progress(11, "Ищу по коду").await;
         let edits = tg.calls("editMessageText");
         assert_eq!(edits.len(), 1, "{edits:?}");
@@ -3067,6 +3106,58 @@ mod tests {
         let sent = tg.calls("sendMessage");
         assert_eq!(sent.len(), 2, "во время паузы в чат не летело ничего: {sent:?}");
         assert!(sent[1].contains("ответ после паузы"), "{sent:?}");
+        assert!(outbox::pending(&app.cfg.outbox_dir).is_empty(), "очередь разобрана");
+    }
+
+    #[tokio::test]
+    async fn the_status_bubble_stays_quiet_during_a_telegram_pause() {
+        let (app, tg) = e2e_with("bubblepause", |c| {
+            c.status_bubble = true;
+            c.bubble_edit_secs = 1;
+        });
+        let tg = tg.script(
+            "sendMessage",
+            vec![r#"{"ok":false,"description":"Too Many Requests: retry after 60","parameters":{"retry_after":60}}"#.into()],
+        );
+        // первая попытка создать пузырь упирается в лимит и заводит паузу
+        app.status(11, "Читаю файл: main.rs").await;
+        assert!(app.bot.send_paused(), "пауза от Telegram заведена");
+        // агент продолжает работать — пузырь не должен дёргать API и плодить
+        // ошибки «sendMessage: пауза Telegram ещё N с» в журнале
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        app.status_progress(11, "Ищу по коду").await;
+        app.status(11, "Правлю файл: main.rs").await;
+        assert_eq!(tg.calls("sendMessage").len(), 1, "за время запрета — одна попытка: {:?}", tg.requests());
+        assert!(tg.calls("editMessageText").is_empty(), "правка под запретом: {:?}", tg.requests());
+        // состояние пузыря живое: после разблокировки правка выйдет актуальной
+        let bubbles = app.status.lock().await;
+        assert_eq!(bubbles[&11].line, "Правлю файл: main.rs", "строка обновлена без обращения к API");
+    }
+
+    #[tokio::test]
+    async fn after_a_pause_the_queue_keeps_only_results() {
+        let (app, tg) = e2e_with("flushresult", |c| c.send_quiet_secs = 0);
+        let tg = tg.script(
+            "sendMessage",
+            vec![r#"{"ok":false,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}"#.into()],
+        );
+        app.bot.send_text(11, "первая попытка").await;
+        assert!(app.bot.send_paused(), "пауза от Telegram заведена");
+        // за время запрета в очереди накопились служебные заметки и результат
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Note, "🕐 задача принята")).unwrap();
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "итог: замер завершён")).unwrap();
+        let handle = tokio::spawn(flush_outbox(app.clone()));
+        for _ in 0..40 {
+            if tg.calls("sendMessage").len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        handle.abort();
+        let sent = tg.calls("sendMessage");
+        assert_eq!(sent.len(), 2, "разблокировка одна — отправка одна: {sent:?}");
+        assert!(sent[1].contains("итог: замер завершён"), "результат дошёл: {sent:?}");
+        assert!(!sent[1].contains("задача принята"), "служебная заметка после запрета не нужна: {sent:?}");
         assert!(outbox::pending(&app.cfg.outbox_dir).is_empty(), "очередь разобрана");
     }
 
