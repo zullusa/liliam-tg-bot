@@ -1809,7 +1809,7 @@ mod tests {
         // живой claude дёргать нечем (и бессмысленно)
         let agent = fake_agent("ttl", &[r#"{"type":"result","result":"свежий ответ"}"#], 0, false);
         let (app, tg) = e2e_agent("ttl", &agent);
-        let path = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Agent, "старый анонс из прошлого вечера")).unwrap();
+        let path = outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Note, "старая заметка из прошлого вечера")).unwrap();
         // помечаем запись как часовую давность: лимит Telegram задержал очередь
         let raw = std::fs::read_to_string(&path).unwrap().replace("\"ts\":", "\"ts\": 1, \"_x\":");
         std::fs::write(path, raw).unwrap();

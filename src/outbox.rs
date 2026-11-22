@@ -138,16 +138,17 @@ pub fn due_chats(items: &[(PathBuf, Item)], now: i64, policy: &Policy) -> Vec<i6
 /// связи не было). Отправлять их через час после смысла уже нет — человек
 /// получает «старые ответы», которые он видел в живой переписке. Такие снимаем
 /// с очереди и пишем в журнал, сколько и почему убрали. `ttl_ms <= 0` — срок
-/// отключён, очередь ждёт сколько угодно. Исключение — финальный ответ агента
-/// (`Answer`): его Telegram и держал, это именно тот результат, которого ждёт
-/// человек, выбросить его на выходе бессмысленнее всего.
+/// отключён, очередь ждёт сколько угодно. Не протухает то, что человек ждёт:
+/// финальный ответ агента (`Answer`) и его собственные сообщения (`Agent`) —
+/// Telegram их и держал, выбросить результат на выходе бессмысленнее всего.
+/// Служебные заметки (`Note`) — только они и портятся.
 pub fn stale_paths(items: &[(PathBuf, Item)], now: i64, ttl_ms: i64) -> Vec<PathBuf> {
     if ttl_ms <= 0 {
         return Vec::new();
     }
     items
         .iter()
-        .filter(|(_, it)| it.kind != Kind::Answer && now - it.ts > ttl_ms)
+        .filter(|(_, it)| it.kind == Kind::Note && now - it.ts > ttl_ms)
         .map(|(p, _)| p.clone())
         .collect()
 }
@@ -408,22 +409,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_items_leave_the_queue_but_the_answer_waits_out_the_ban() {
+    fn stale_items_leave_the_queue_but_results_wait_out_the_ban() {
         let dir = std::env::temp_dir().join(format!("claudetg-stale-{}", now_ms()));
         let _ = std::fs::remove_dir_all(&dir);
-        // час назад: заметка протхла, а финальный ответ пережидает любой запрет —
-        // именно его человек и ждёт после разблокировки
+        // часовалая давность: заметка протхла, а результат (ответ агента и его
+        // собственные сообщения) пережидает любой запрет — его человек и ждёт
         enqueue(&dir, &item(1, 0, Kind::Note, "старая заметка")).unwrap();
         enqueue(&dir, &item(1, 0, Kind::Answer, "очень старый ответ")).unwrap();
-        // сообщение агента старше срока уходит, как и раньше
-        enqueue(&dir, &item(1, 0, Kind::Agent, "простроченный анонс")).unwrap();
+        enqueue(&dir, &item(1, 0, Kind::Agent, "старый отчёт о работе")).unwrap();
         let all = pending(&dir);
         let stale = stale_paths(&all, 60 * 60_000, 30 * 60_000);
-        assert_eq!(stale.len(), 2, "протухли заметка и анонс: {stale:?}");
+        assert_eq!(stale.len(), 1, "протхла только служебная заметка: {stale:?}");
         discard(&stale);
         let left = pending(&dir);
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].1.text, "очень старый ответ");
+        assert_eq!(left.len(), 2, "результаты на месте: {left:?}");
         // ttl=0 — срок отключён, не протухает ничего
         assert!(stale_paths(&pending(&dir), i64::MAX, 0).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
