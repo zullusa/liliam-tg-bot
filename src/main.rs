@@ -96,6 +96,9 @@ struct App {
     status: Mutex<HashMap<i64, Bubble>>,
     /// Последние отправленные в чат тексты — по ним отсекаем повторы.
     recent_out: Mutex<HashMap<i64, Vec<String>>>,
+    /// Замок разбора очереди на каждый чат: два разбора одного чата не должны
+    /// отправить одно и то же сообщение дважды.
+    drains: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
 
 struct Running {
@@ -296,6 +299,15 @@ impl App {
     /// Отправляет всё, что накопилось в очереди чата: повторы и служебную
     /// болтовню не отправляем, остальное склеиваем в одно сообщение.
     async fn drain_outbox(&self, chat_id: i64) {
+        // Один разбор очереди на чат за раз: два разбора подряд (шаг агента
+        // закончился и таймер тишины сработал в тот же миг) читали бы одни и те
+        // же файлы очереди и отправляли их дважды — это и были задвоенные
+        // сообщения в чате.
+        let gate = {
+            let mut drains = self.drains.lock().await;
+            drains.entry(chat_id).or_default().clone()
+        };
+        let _drain_guard = gate.lock().await;
         let all = outbox::pending(&self.cfg.outbox_dir);
         let mut mine: Vec<(PathBuf, Item)> =
             all.into_iter().filter(|(_, it)| it.chat == chat_id).collect();
@@ -327,6 +339,26 @@ impl App {
         // уйдут своим чередом.
         let (files, texts): (Vec<&(PathBuf, Item)>, Vec<&(PathBuf, Item)>) =
             mine.iter().partition(|(_, it)| it.is_file());
+        // То, что уже принято в этой пачке: одинаковые записи, поставленные в
+        // один шаг, схлопываем — иначе они склеиваются в одно сообщение и
+        // читаются дважды.
+        let mut seen_texts: Vec<String> = Vec::new();
+        let mut seen_files: Vec<String> = Vec::new();
+        let mut dup_files: Vec<PathBuf> = Vec::new();
+        let files: Vec<&(PathBuf, Item)> = files
+            .into_iter()
+            .filter(|(queue_path, it)| {
+                let key = it.path.clone().unwrap_or_default().display().to_string();
+                if seen_files.contains(&key) {
+                    log::info!("chat {chat_id}: файл в очереди уже учтён — {key}");
+                    dup_files.push(queue_path.clone());
+                    return false;
+                }
+                seen_files.push(key);
+                true
+            })
+            .collect();
+        outbox::discard(&dup_files);
         if !files.is_empty() {
             self.send_files(chat_id, &files).await;
         }
@@ -346,14 +378,17 @@ impl App {
                 self.status_dropped(chat_id).await;
                 continue;
             }
-            {
-                let mut recent = self.recent_out.lock().await;
-                if outbox::is_repeat(text, recent.entry(chat_id).or_default()) {
-                    log::info!("chat {chat_id}: повтор не отправлен");
-                    self.status_dropped(chat_id).await;
-                    continue;
-                }
+            let already = {
+                let recent = self.recent_out.lock().await;
+                outbox::is_repeat(text, recent.get(&chat_id).map(Vec::as_slice).unwrap_or_default())
+                    || outbox::same_text(text, &seen_texts)
+            };
+            if already {
+                log::info!("chat {chat_id}: повтор не отправлен");
+                self.status_dropped(chat_id).await;
+                continue;
             }
+            seen_texts.push(text.to_string());
             kept.push(text.to_string());
         }
         if kept.is_empty() {
@@ -587,6 +622,7 @@ async fn run_bot(cfg: Config, bot: Bot) -> Result<()> {
         // память о повторах переживает перезапуск бота: берём последние тексты
         // из журнала отправленного, иначе рестарт отправляет чату то же самое
         recent_out: Mutex::new(outbox::seed_recent(&outbox::read_sent(&cfg.sent_log), RECENT_SENDS)),
+        drains: Mutex::new(HashMap::new()),
         bot,
         cfg,
     });
@@ -1659,6 +1695,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
         };
         (Arc::new(app), tg)
     }
@@ -1684,6 +1721,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(recent),
+            drains: Mutex::new(HashMap::new()),
         };
         (Arc::new(app), tg)
     }
@@ -1855,6 +1893,7 @@ mod tests {
         // так же, как при реальном старте: память о повторах сеется из журнала
         let app = Arc::new(App {
             recent_out: Mutex::new(outbox::seed_recent(&outbox::read_sent(&cfg.sent_log), RECENT_SENDS)),
+            drains: Mutex::new(HashMap::new()),
             cfg,
             bot: tg.bot(),
             chats: Mutex::new(HashMap::new()),
@@ -1967,6 +2006,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
             cfg,
         });
         run_turn(&app, 11, "дело".into(), Arc::new(Notify::new())).await;
@@ -2013,6 +2053,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
             cfg,
         });
         // расшифровка сессии claude — источник контекста для opencode
@@ -2312,6 +2353,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
             cfg,
         });
         // человек печатает задачу двумя сообщениями — запуск должен быть один
@@ -2508,6 +2550,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
             cfg,
         });
         app.queue(11, Kind::Answer, "это должно дойти").await;
@@ -2535,6 +2578,7 @@ mod tests {
             last_text: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             recent_out: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
             cfg,
         });
         app.queue(11, Kind::Answer, "ответ, который не пустили").await;
@@ -2639,6 +2683,7 @@ mod tests {
                 last_text: Mutex::new(HashMap::new()),
                 status: Mutex::new(HashMap::new()),
                 recent_out: Mutex::new(HashMap::new()),
+                drains: Mutex::new(HashMap::new()),
             });
         let mut offset = 0;
         poll_once(&app, &mut offset).await.unwrap();
@@ -2867,6 +2912,55 @@ mod tests {
         let left = outbox::pending(&app.cfg.outbox_dir);
         assert_eq!(left.len(), 1, "файл остался в очереди: {left:?}");
         assert!(left[0].1.is_file(), "в очереди именно файл");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_turn_and_a_timer_drain_the_queue_only_once() {
+        // шаг агента закончился и таймер тишины сработал в тот же миг: два
+        // разбора очереди подряд не должны отправить одно сообщение дважды
+        let (app, tg) = e2e("drainrace");
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "Один и тот же итог шага")).unwrap();
+        tokio::join!(app.drain_outbox(11), app.drain_outbox(11));
+        let sent = tg.calls("sendMessage");
+        assert_eq!(sent.len(), 1, "очередь разобрана один раз: {sent:?}");
+        assert!(outbox::pending(&app.cfg.outbox_dir).is_empty(), "очередь пуста");
+    }
+
+    #[tokio::test]
+    async fn identical_items_queued_in_one_step_collapse() {
+        // один и тот же текст поставили в очередь дважды за шаг (явная отправка
+        // и итоговый ответ): в чат уходит одна копия, а не склейка «текст ··· текст»
+        let (app, tg) = e2e("batchdup");
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Agent, "Разобрался: причина в настройках таймаута")).unwrap();
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "Разобрался: причина в настройках таймаута")).unwrap();
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::new(11, Kind::Answer, "Файл приложен отдельно")).unwrap();
+        app.drain_outbox(11).await;
+        let sent = tg.calls("sendMessage");
+        assert_eq!(sent.len(), 1, "одно сообщение: {sent:?}");
+        assert_eq!(
+            sent[0].matches("настройках таймаута").count(),
+            1,
+            "повтор свёрнут внутри пачки: {}",
+            sent[0]
+        );
+        assert!(sent[0].contains("Файл приложен отдельно"), "новое дошло: {}", sent[0]);
+    }
+
+    #[tokio::test]
+    async fn the_same_file_queued_twice_in_one_step_goes_once() {
+        let (app, tg) = e2e("filedup");
+        let dir = std::env::temp_dir().join(format!("claudetg-filedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let apk = dir.join("vypusk.apk");
+        std::fs::write(&apk, "apk").unwrap();
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::file(11, Kind::Agent, &apk, "выпуск")).unwrap();
+        outbox::enqueue(&app.cfg.outbox_dir, &Item::file(11, Kind::Answer, &apk, "тот же выпуск")).unwrap();
+        app.drain_outbox(11).await;
+        let docs = tg.calls("sendDocument");
+        assert_eq!(docs.len(), 1, "файл один раз: {docs:?}");
+        assert!(outbox::pending(&app.cfg.outbox_dir).is_empty(), "обе записи сняты с очереди");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -206,6 +206,14 @@ pub fn normalize(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Совпадение один в один после нормализки: внутри одного шага склеиваем
+/// только одинаковые записи. Приблизительное сравнение (`is_repeat`) для этого
+/// не годится — «ответ 1» и «ответ 2» разные части одного ответа, а не повтор.
+pub fn same_text(text: &str, seen: &[String]) -> bool {
+    let new = normalize(text);
+    !new.is_empty() && seen.iter().any(|old| normalize(old) == new)
+}
+
 /// Такой же текст уже отправляли: совпадение после нормализки или когда один
 /// текст — почти весь другой (повтор с одной лишней стркой).
 pub fn is_repeat(text: &str, recent: &[String]) -> bool {
@@ -472,6 +480,15 @@ mod tests {
         assert!(is_repeat("Готово: покрытие бэкенда 100 %", &recent));
         assert!(!is_repeat("Готово: покрытие фронтенда 100 %", &recent));
         assert!(is_repeat("   ", &recent));
+    }
+
+    #[test]
+    fn same_text_collapses_only_identical_items() {
+        let seen = vec!["Готово: покрытие бэкенда 100 %".to_string()];
+        assert!(same_text("готово покрытие бэкенда 100%", &seen));
+        assert!(!same_text("Готово: покрытие фронтенда 100 %", &seen));
+        assert!(!same_text("   ", &seen));
+        assert!(!same_text("дело сделано", &[]));
     }
 
     #[test]
